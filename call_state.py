@@ -9,11 +9,12 @@ State invariants:
 - State changes are atomic, logged, and tracked
 - Terminal states cannot be exited
 - State machine is thread-safe
+- No state can be stuck indefinitely
 """
 
 import logging
 from enum import Enum
-from typing import Optional, Set, List, Dict, Any
+from typing import Optional, Set, List, Dict, Any, Callable
 from datetime import datetime, timezone
 import threading
 from dataclasses import dataclass, field
@@ -44,7 +45,7 @@ class CallState(Enum):
     
     # Entry phase
     GREETING = "greeting"               # Playing initial greeting
-    LANGUAGE_DETECT = "language_detect" # Detecting user language
+    LANGUAGE_DETECT = "language_detect" # Detecting user language (ONCE only)
     
     # Active conversation
     ACTIVE = "active"                   # In active conversation flow
@@ -53,7 +54,7 @@ class CallState(Enum):
     SPEAKING = "speaking"               # Synthesizing/playing AI response
     
     # Special states
-    TRANSFERRING = "transferring"       # Call transfer in progress
+    TRANSFERRING = "transferring"       # Call transfer in progress (frozen state)
     
     # Terminal states
     CLOSING = "closing"                 # Graceful shutdown in progress
@@ -70,6 +71,11 @@ class StateTransitionError(Exception):
 
 class TerminalStateError(Exception):
     """Raised when attempting to transition from a terminal state."""
+    pass
+
+
+class StateTimeoutError(Exception):
+    """Raised when state has been occupied too long."""
     pass
 
 
@@ -92,6 +98,9 @@ class CallStateMachine:
     - Atomic state transitions
     - Comprehensive state history
     - Transition metrics and timing
+    - Per-state timeout enforcement
+    - State change callbacks
+    - Stuck state detection
     """
     
     # Terminal states that cannot be exited
@@ -109,6 +118,32 @@ class CallStateMachine:
         CallState.SPEAKING
     }
     
+    # Frozen states where NO AI/business logic should execute
+    FROZEN_STATES = {
+        CallState.TRANSFERRING,
+        CallState.CLOSING,
+        *TERMINAL_STATES
+    }
+    
+    # Maximum time allowed in each state (seconds) - enforced by watchdog
+    STATE_TIMEOUTS = {
+        CallState.INIT: 5.0,
+        CallState.CONNECTING: 30.0,
+        CallState.GREETING: 15.0,
+        CallState.LANGUAGE_DETECT: 10.0,
+        CallState.LISTENING: 90.0,  # Silence timeout
+        CallState.THINKING: 15.0,   # AI response timeout
+        CallState.SPEAKING: 60.0,   # TTS timeout
+        CallState.ACTIVE: float('inf'),  # No limit on active state
+        CallState.TRANSFERRING: 45.0,
+        CallState.CLOSING: 10.0,
+        # Terminal states have no timeout
+        CallState.CLOSED: float('inf'),
+        CallState.TRANSFERRED: float('inf'),
+        CallState.FAILED: float('inf'),
+        CallState.TIMEOUT: float('inf')
+    }
+    
     # Define valid state transitions
     VALID_TRANSITIONS = {
         CallState.INIT: {
@@ -119,7 +154,8 @@ class CallStateMachine:
         CallState.CONNECTING: {
             CallState.GREETING,
             CallState.FAILED,
-            CallState.CLOSED
+            CallState.CLOSED,
+            CallState.TIMEOUT
         },
         CallState.GREETING: {
             CallState.LANGUAGE_DETECT,
@@ -127,14 +163,16 @@ class CallStateMachine:
             CallState.LISTENING,
             CallState.CLOSING,
             CallState.FAILED,
-            CallState.CLOSED
+            CallState.CLOSED,
+            CallState.TIMEOUT
         },
         CallState.LANGUAGE_DETECT: {
             CallState.ACTIVE,
             CallState.LISTENING,
             CallState.CLOSING,
             CallState.FAILED,
-            CallState.CLOSED
+            CallState.CLOSED,
+            CallState.TIMEOUT
         },
         CallState.ACTIVE: {
             CallState.LISTENING,
@@ -176,13 +214,15 @@ class CallStateMachine:
         CallState.TRANSFERRING: {
             CallState.TRANSFERRED,
             CallState.FAILED,
-            CallState.CLOSED
+            CallState.CLOSED,
+            CallState.TIMEOUT
         },
         CallState.CLOSING: {
             CallState.CLOSED,
-            CallState.FAILED
+            CallState.FAILED,
+            CallState.TIMEOUT
         },
-        # Terminal states
+        # Terminal states cannot transition
         CallState.CLOSED: set(),
         CallState.TRANSFERRED: set(),
         CallState.FAILED: set(),
@@ -220,6 +260,14 @@ class CallStateMachine:
         # Metrics
         self._transition_count = 0
         self._forced_transition_count = 0
+        self._invalid_transition_attempts = 0
+        
+        # Callbacks
+        self._on_state_change_callbacks: List[Callable[[CallState, CallState], None]] = []
+        self._on_terminal_state_callbacks: List[Callable[[CallState], None]] = []
+        
+        # Flags
+        self._language_detected = False  # Track if language detection happened
         
         logger.info(
             "State machine initialized",
@@ -228,6 +276,32 @@ class CallStateMachine:
                 "initial_state": initial_state.value
             }
         )
+    
+    def register_state_change_callback(
+        self,
+        callback: Callable[[CallState, CallState], None]
+    ) -> None:
+        """
+        Register callback for state changes.
+        
+        Args:
+            callback: Function(old_state, new_state) called on transitions
+        """
+        with self._lock:
+            self._on_state_change_callbacks.append(callback)
+    
+    def register_terminal_state_callback(
+        self,
+        callback: Callable[[CallState], None]
+    ) -> None:
+        """
+        Register callback for terminal state entry.
+        
+        Args:
+            callback: Function(terminal_state) called when terminal state reached
+        """
+        with self._lock:
+            self._on_terminal_state_callbacks.append(callback)
     
     @property
     def current_state(self) -> CallState:
@@ -249,10 +323,10 @@ class CallStateMachine:
             target_state: Desired next state
             
         Returns:
-            True if transition is valid
+            True if transition is allowed
         """
         with self._lock:
-            # Cannot exit terminal states
+            # Terminal states cannot transition
             if self._current_state in self.TERMINAL_STATES:
                 return False
             
@@ -285,6 +359,7 @@ class CallStateMachine:
         with self._lock:
             # Check terminal state
             if self._current_state in self.TERMINAL_STATES:
+                self._invalid_transition_attempts += 1
                 error_msg = (
                     f"Cannot transition from terminal state: "
                     f"{self._current_state.value}"
@@ -294,13 +369,15 @@ class CallStateMachine:
                     extra={
                         "call_id": self.call_id,
                         "current_state": self._current_state.value,
-                        "attempted_target": target_state.value
+                        "attempted_target": target_state.value,
+                        "invalid_attempts": self._invalid_transition_attempts
                     }
                 )
                 raise TerminalStateError(error_msg)
             
             # Validate transition
             if not self.can_transition_to(target_state):
+                self._invalid_transition_attempts += 1
                 error_msg = (
                     f"Invalid transition: "
                     f"{self._current_state.value} -> {target_state.value}"
@@ -311,16 +388,34 @@ class CallStateMachine:
                         "call_id": self.call_id,
                         "from_state": self._current_state.value,
                         "to_state": target_state.value,
-                        "reason": reason
+                        "reason": reason,
+                        "invalid_attempts": self._invalid_transition_attempts
                     }
                 )
                 raise StateTransitionError(error_msg)
+            
+            # Enforce language detection happens only once
+            if target_state == CallState.LANGUAGE_DETECT:
+                if self._language_detected:
+                    error_msg = "Language detection can only happen once per call"
+                    logger.error(
+                        error_msg,
+                        extra={
+                            "call_id": self.call_id,
+                            "current_state": self._current_state.value
+                        }
+                    )
+                    raise StateTransitionError(error_msg)
             
             # Perform atomic transition
             old_state = self._current_state
             self._previous_state = old_state
             self._current_state = target_state
             self._transition_count += 1
+            
+            # Track language detection
+            if target_state == CallState.LANGUAGE_DETECT:
+                self._language_detected = True
             
             # Record in history
             entry = StateEntry(
@@ -342,6 +437,12 @@ class CallStateMachine:
                     "metadata": metadata
                 }
             )
+            
+            # Execute callbacks
+            self._execute_state_change_callbacks(old_state, target_state)
+            
+            if target_state in self.TERMINAL_STATES:
+                self._execute_terminal_state_callbacks(target_state)
             
             return True
     
@@ -391,6 +492,47 @@ class CallStateMachine:
                 metadata=metadata or {}
             )
             self._state_history.append(entry)
+            
+            # Execute callbacks even on forced transition
+            self._execute_state_change_callbacks(old_state, target_state)
+            
+            if target_state in self.TERMINAL_STATES:
+                self._execute_terminal_state_callbacks(target_state)
+    
+    def _execute_state_change_callbacks(
+        self,
+        old_state: CallState,
+        new_state: CallState
+    ) -> None:
+        """Execute registered state change callbacks."""
+        for callback in self._on_state_change_callbacks:
+            try:
+                callback(old_state, new_state)
+            except Exception as e:
+                logger.error(
+                    f"State change callback failed: {e}",
+                    extra={
+                        "call_id": self.call_id,
+                        "old_state": old_state.value,
+                        "new_state": new_state.value
+                    },
+                    exc_info=True
+                )
+    
+    def _execute_terminal_state_callbacks(self, terminal_state: CallState) -> None:
+        """Execute registered terminal state callbacks."""
+        for callback in self._on_terminal_state_callbacks:
+            try:
+                callback(terminal_state)
+            except Exception as e:
+                logger.error(
+                    f"Terminal state callback failed: {e}",
+                    extra={
+                        "call_id": self.call_id,
+                        "terminal_state": terminal_state.value
+                    },
+                    exc_info=True
+                )
     
     def is_terminal(self) -> bool:
         """Check if current state is terminal."""
@@ -403,9 +545,24 @@ class CallStateMachine:
             return self._current_state in self.ACTIVE_STATES or \
                    self._current_state == CallState.ACTIVE
     
+    def is_frozen(self) -> bool:
+        """Check if call is in a frozen state (no AI/business logic allowed)."""
+        with self._lock:
+            return self._current_state in self.FROZEN_STATES
+    
     def is_closed(self) -> bool:
         """Check if call has been closed (any terminal state)."""
         return self.is_terminal()
+    
+    def can_execute_ai(self) -> bool:
+        """Check if AI execution is allowed in current state."""
+        with self._lock:
+            return not self.is_frozen()
+    
+    def can_execute_business_logic(self) -> bool:
+        """Check if business logic execution is allowed in current state."""
+        with self._lock:
+            return not self.is_frozen()
     
     def get_state_duration(self) -> float:
         """
@@ -422,6 +579,27 @@ class CallStateMachine:
             return (
                 datetime.now(timezone.utc) - last_entry.entered_at
             ).total_seconds()
+    
+    def get_state_timeout(self) -> float:
+        """
+        Get maximum allowed duration for current state.
+        
+        Returns:
+            Maximum seconds allowed in current state
+        """
+        with self._lock:
+            return self.STATE_TIMEOUTS.get(self._current_state, float('inf'))
+    
+    def is_state_timeout_exceeded(self) -> bool:
+        """
+        Check if current state has exceeded its timeout.
+        
+        Returns:
+            True if state has been occupied too long
+        """
+        duration = self.get_state_duration()
+        timeout = self.get_state_timeout()
+        return duration > timeout
     
     def get_total_duration(self) -> float:
         """
@@ -488,11 +666,17 @@ class CallStateMachine:
                 ),
                 "is_terminal": self.is_terminal(),
                 "is_active": self.is_active(),
+                "is_frozen": self.is_frozen(),
+                "can_execute_ai": self.can_execute_ai(),
                 "state_duration_seconds": self.get_state_duration(),
+                "state_timeout_seconds": self.get_state_timeout(),
+                "is_timeout_exceeded": self.is_state_timeout_exceeded(),
                 "total_duration_seconds": self.get_total_duration(),
                 "transition_count": self._transition_count,
                 "forced_transition_count": self._forced_transition_count,
-                "state_history_length": len(self._state_history)
+                "invalid_transition_attempts": self._invalid_transition_attempts,
+                "state_history_length": len(self._state_history),
+                "language_detected": self._language_detected
             }
     
     def __repr__(self) -> str:
