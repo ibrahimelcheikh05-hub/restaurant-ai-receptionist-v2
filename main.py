@@ -239,52 +239,51 @@ def create_event_handlers(call_id: str, tenant_id: str) -> dict:
     }
 
 
-async def main():
-    """Main entry point."""
-    # Load settings
-    settings = get_settings()
-    
-    # Setup logging
-    setup_logging(level=settings.log_level)
-    logger = logging.getLogger(__name__)
-    
-    logger.info(f"Starting in {settings.environment} mode")
-    
-    # Validate settings
-    errors = settings.validate()
-    if errors:
-        logger.error(f"Configuration errors: {errors}")
+# Load settings
+settings = get_settings()
+
+# Setup logging
+setup_logging(level=settings.log_level)
+logger = logging.getLogger(__name__)
+
+logger.info(f"Starting in {settings.environment} mode")
+
+# Validate settings
+errors = settings.validate()
+if errors:
+    logger.error(f"Configuration errors: {errors}")
+    # Don't exit in production - let it fail more gracefully
+    if settings.environment != "production":
         sys.exit(1)
-    
-    # Initialize system
+
+# Create Vocode config manager
+config_manager = InMemoryConfigManager()
+
+# Create Vocode server - this creates the FastAPI app
+server = VocodeServer(
+    base_url=settings.vocode.base_url,
+    config_manager=config_manager,
+    handler_factory=create_event_handlers
+)
+
+# Export the app for uvicorn
+app = server.app
+
+# Initialize system on startup
+@app.on_event("startup")
+async def startup_event():
+    """Run initialization on startup."""
     await initialize_system()
-    
-    # Create Vocode config manager
-    config_manager = InMemoryConfigManager()
-    
-    # Create Vocode server
-    server = VocodeServer(
-        base_url=settings.vocode.base_url,
-        config_manager=config_manager,
-        handler_factory=create_event_handlers
-    )
-    
     logger.info(
-        f"Starting server on {settings.vocode.host}:{settings.vocode.port}"
-    )
-    
-    # Run server
-    server.run(
-        host=settings.vocode.host,
-        port=settings.vocode.port
+        f"Server started on {settings.vocode.host}:{settings.vocode.port}"
     )
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-    except Exception as e:
-        logging.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+    # This runs when executing directly with python main.py
+    import uvicorn
+    uvicorn.run(
+        app,
+        host=settings.vocode.host,
+        port=settings.vocode.port
+    )
