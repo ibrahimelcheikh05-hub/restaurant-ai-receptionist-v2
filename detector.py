@@ -571,6 +571,7 @@ def detect_language(
         text: Text to detect from
         is_final: Whether this is final transcript
         
+        
     Returns:
         Detection result
     """
