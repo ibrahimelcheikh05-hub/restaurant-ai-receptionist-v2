@@ -83,14 +83,27 @@ class LanguageDetector:
     - Confidence threshold enforcement
     - Fallback to default language
     - Support for multiple languages
+    - Timeout enforcement
+    - Max detection attempts
+    
+    SAFETY:
+    - Language can only be locked ONCE per call
+    - Detection attempts are limited
+    - Timeouts prevent infinite detection loops
+    - Automatic fallback on repeated failures
     """
+    
+    MAX_DETECTION_ATTEMPTS = 3
+    DETECTION_TIMEOUT_SECONDS = 10.0
     
     def __init__(
         self,
         supported_languages: Optional[List[str]] = None,
         default_language: str = "en",
         min_confidence: float = 0.7,
-        min_text_length: int = 20
+        min_text_length: int = 20,
+        max_attempts: int = MAX_DETECTION_ATTEMPTS,
+        timeout_seconds: float = DETECTION_TIMEOUT_SECONDS
     ):
         """
         Initialize language detector.
@@ -100,14 +113,22 @@ class LanguageDetector:
             default_language: Default/fallback language
             min_confidence: Minimum confidence threshold
             min_text_length: Minimum text length for detection
+            max_attempts: Maximum detection attempts per call
+            timeout_seconds: Maximum time allowed for detection
         """
         self.supported_languages = supported_languages or ["en", "es", "ar"]
         self.default_language = default_language
         self.min_confidence = min_confidence
         self.min_text_length = min_text_length
+        self.max_attempts = max_attempts
+        self.timeout_seconds = timeout_seconds
         
         # Language locks per call
         self._locks: Dict[str, LanguageLock] = {}
+        
+        # Detection attempt tracking
+        self._attempt_counts: Dict[str, int] = {}
+        self._first_attempt_time: Dict[str, datetime] = {}
         
         logger.info(
             "LanguageDetector initialized",
@@ -115,6 +136,8 @@ class LanguageDetector:
                 "supported": self.supported_languages,
                 "default": default_language,
                 "min_confidence": min_confidence,
+                "max_attempts": max_attempts,
+                "timeout": timeout_seconds,
                 "langdetect_available": LANGDETECT_AVAILABLE
             }
         )
@@ -126,7 +149,7 @@ class LanguageDetector:
         is_final: bool = True
     ) -> DetectionResult:
         """
-        Detect language from text.
+        Detect language from text with attempt tracking and timeout.
         
         Args:
             call_id: Call identifier
@@ -150,6 +173,39 @@ class LanguageDetector:
                 is_locked=True
             )
         
+        # Track attempt
+        now = datetime.now(timezone.utc)
+        if call_id not in self._attempt_counts:
+            self._attempt_counts[call_id] = 0
+            self._first_attempt_time[call_id] = now
+        
+        self._attempt_counts[call_id] += 1
+        
+        # Check if exceeded max attempts
+        if self._attempt_counts[call_id] > self.max_attempts:
+            logger.warning(
+                f"Max detection attempts exceeded: {self._attempt_counts[call_id]}",
+                extra={"call_id": call_id}
+            )
+            return self._fallback_result(
+                call_id,
+                "max_attempts_exceeded"
+            )
+        
+        # Check if exceeded timeout
+        first_attempt = self._first_attempt_time[call_id]
+        elapsed = (now - first_attempt).total_seconds()
+        
+        if elapsed > self.timeout_seconds:
+            logger.warning(
+                f"Detection timeout exceeded: {elapsed:.1f}s",
+                extra={"call_id": call_id}
+            )
+            return self._fallback_result(
+                call_id,
+                "timeout_exceeded"
+            )
+        
         # Reject partial transcripts
         if not is_final:
             logger.debug(
@@ -170,9 +226,13 @@ class LanguageDetector:
                 f"Text too short for detection: {len(text)} chars",
                 extra={"call_id": call_id}
             )
-            return self._fallback_result(
-                call_id,
-                "text_too_short"
+            # Don't fallback immediately on short text - allow retry
+            return DetectionResult(
+                status=DetectionStatus.REJECTED,
+                language=self.default_language,
+                confidence=0.0,
+                is_locked=False,
+                fallback_reason="text_too_short"
             )
         
         # Attempt detection
@@ -187,9 +247,17 @@ class LanguageDetector:
             detections = detect_langs(text)
             
             if not detections:
-                return self._fallback_result(
-                    call_id,
-                    "no_detection"
+                logger.warning(
+                    "No language detected",
+                    extra={"call_id": call_id}
+                )
+                # Allow retry if under attempt limit
+                return DetectionResult(
+                    status=DetectionStatus.REJECTED,
+                    language=self.default_language,
+                    confidence=0.0,
+                    is_locked=False,
+                    fallback_reason="no_detection"
                 )
             
             # Get top detection
@@ -201,7 +269,8 @@ class LanguageDetector:
                 f"Language detected: {detected_lang} ({confidence:.2f})",
                 extra={
                     "call_id": call_id,
-                    "text_length": len(text)
+                    "text_length": len(text),
+                    "attempt": self._attempt_counts[call_id]
                 }
             )
             
@@ -222,18 +291,25 @@ class LanguageDetector:
                     f"Low confidence: {confidence:.2f}",
                     extra={"call_id": call_id}
                 )
-                return self._fallback_result(
-                    call_id,
-                    "low_confidence"
+                # Allow retry if under attempt limit
+                return DetectionResult(
+                    status=DetectionStatus.REJECTED,
+                    language=self.default_language,
+                    confidence=confidence,
+                    is_locked=False,
+                    fallback_reason="low_confidence"
                 )
             
-            # Lock language
+            # Lock language (SUCCESS!)
             self._lock_language(
                 call_id=call_id,
                 language=detected_lang,
                 confidence=confidence,
                 method="detected"
             )
+            
+            # Clean up tracking
+            self._cleanup_tracking(call_id)
             
             return DetectionResult(
                 status=DetectionStatus.SUCCESS,
@@ -270,7 +346,7 @@ class LanguageDetector:
         reason: str
     ) -> DetectionResult:
         """
-        Create fallback result.
+        Create fallback result and lock to default language.
         
         Args:
             call_id: Call identifier
@@ -287,6 +363,9 @@ class LanguageDetector:
             method="fallback"
         )
         
+        # Clean up tracking
+        self._cleanup_tracking(call_id)
+        
         logger.info(
             f"Fallback to default language: {self.default_language}",
             extra={"call_id": call_id, "reason": reason}
@@ -299,6 +378,18 @@ class LanguageDetector:
             is_locked=True,
             fallback_reason=reason
         )
+    
+    def _cleanup_tracking(self, call_id: str) -> None:
+        """
+        Clean up attempt tracking for call.
+        
+        Args:
+            call_id: Call identifier
+        """
+        if call_id in self._attempt_counts:
+            del self._attempt_counts[call_id]
+        if call_id in self._first_attempt_time:
+            del self._first_attempt_time[call_id]
     
     def _lock_language(
         self,
@@ -389,7 +480,7 @@ class LanguageDetector:
     
     def unlock(self, call_id: str) -> bool:
         """
-        Unlock language for call.
+        Unlock language for call and clean up tracking.
         
         Only use for cleanup after call ends.
         
@@ -399,14 +490,20 @@ class LanguageDetector:
         Returns:
             True if unlocked
         """
+        unlocked = False
+        
         if call_id in self._locks:
             del self._locks[call_id]
+            unlocked = True
             logger.info(
                 "Language unlocked",
                 extra={"call_id": call_id}
             )
-            return True
-        return False
+        
+        # Clean up tracking regardless
+        self._cleanup_tracking(call_id)
+        
+        return unlocked
     
     def get_active_locks(self) -> Dict[str, LanguageLock]:
         """Get all active language locks."""
@@ -435,7 +532,10 @@ class LanguageDetector:
             "locks_by_language": locks_by_language,
             "locks_by_method": locks_by_method,
             "supported_languages": self.supported_languages,
-            "default_language": self.default_language
+            "default_language": self.default_language,
+            "pending_detections": len(self._attempt_counts),
+            "max_attempts": self.max_attempts,
+            "timeout_seconds": self.timeout_seconds
         }
 
 
