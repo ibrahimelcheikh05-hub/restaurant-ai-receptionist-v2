@@ -8,7 +8,7 @@ typed access to settings.
 """
 
 import os
-from typing import Optional
+from typing import Optional, Dict
 from dataclasses import dataclass
 
 
@@ -33,10 +33,20 @@ class AISettings:
     
     # OpenAI
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    
+    # Dual model strategy
+    openai_primary_model: str = os.getenv("OPENAI_PRIMARY_MODEL", "gpt-4o")
+    openai_fast_model: str = os.getenv("OPENAI_FAST_MODEL", "gpt-3.5-turbo")
+    
+    # Token limits
     openai_max_tokens: int = int(os.getenv("OPENAI_MAX_TOKENS", "1024"))
+    openai_max_prompt_tokens: int = int(os.getenv("OPENAI_MAX_PROMPT_TOKENS", "4000"))
+    openai_max_completion_tokens: int = int(os.getenv("OPENAI_MAX_COMPLETION_TOKENS", "2000"))
+    
+    # Model parameters
     openai_temperature: float = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
     openai_timeout: float = float(os.getenv("OPENAI_TIMEOUT", "10.0"))
+    openai_fast_timeout: float = float(os.getenv("OPENAI_FAST_TIMEOUT", "5.0"))
 
 
 @dataclass
@@ -46,11 +56,16 @@ class SpeechSettings:
     # Deepgram STT
     deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
     
-    # Google Cloud TTS
-    google_application_credentials: str = os.getenv(
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        ""
+    # ElevenLabs TTS
+    elevenlabs_api_key: str = os.getenv("ELEVENLABS_API_KEY", "")
+    elevenlabs_default_voice_id: str = os.getenv(
+        "ELEVENLABS_DEFAULT_VOICE_ID",
+        "21m00Tcm4TlvDq8ikWAM"  # Rachel voice as default
     )
+    
+    # Optional: Language-to-voice mapping (JSON string)
+    # Format: {"en": "voice_id_1", "es": "voice_id_2", "ar": "voice_id_3"}
+    elevenlabs_voice_map: str = os.getenv("ELEVENLABS_VOICE_MAP", "{}")
 
 
 @dataclass
@@ -171,7 +186,45 @@ class Settings:
         if not self.ai.openai_api_key:
             errors.append("OPENAI_API_KEY not set")
         
+        if not self.speech.deepgram_api_key:
+            errors.append("DEEPGRAM_API_KEY not set")
+        
+        if not self.speech.elevenlabs_api_key:
+            errors.append("ELEVENLABS_API_KEY not set")
+        
         return errors
+    
+    def get_elevenlabs_voice_map(self) -> Dict[str, str]:
+        """
+        Parse ElevenLabs voice map from JSON string.
+        
+        Returns:
+            Dict mapping language codes to voice IDs
+        """
+        import json
+        try:
+            voice_map = json.loads(self.speech.elevenlabs_voice_map)
+            if not isinstance(voice_map, dict):
+                return {}
+            return voice_map
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    
+    def get_voice_id_for_language(self, language_code: str) -> str:
+        """
+        Get voice ID for a specific language.
+        
+        Args:
+            language_code: Language code (e.g., 'en', 'es', 'ar')
+            
+        Returns:
+            Voice ID for the language or default voice ID
+        """
+        voice_map = self.get_elevenlabs_voice_map()
+        return voice_map.get(
+            language_code,
+            self.speech.elevenlabs_default_voice_id
+        )
     
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -185,10 +238,18 @@ class Settings:
                 "port": self.vocode.port
             },
             "ai": {
-                "model": self.ai.openai_model,
+                "primary_model": self.ai.openai_primary_model,
+                "fast_model": self.ai.openai_fast_model,
                 "max_tokens": self.ai.openai_max_tokens,
+                "max_prompt_tokens": self.ai.openai_max_prompt_tokens,
+                "max_completion_tokens": self.ai.openai_max_completion_tokens,
                 "temperature": self.ai.openai_temperature,
-                "timeout": self.ai.openai_timeout
+                "timeout": self.ai.openai_timeout,
+                "fast_timeout": self.ai.openai_fast_timeout
+            },
+            "speech": {
+                "elevenlabs_default_voice": self.speech.elevenlabs_default_voice_id,
+                "elevenlabs_voice_map": self.get_elevenlabs_voice_map()
             },
             "language": {
                 "default": self.language.default_language,
