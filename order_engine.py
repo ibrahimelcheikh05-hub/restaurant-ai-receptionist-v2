@@ -1,53 +1,106 @@
 """
 Order Engine
 ============
-Transactional order state machine.
+Transactional order state machine with strict validation.
 
 Responsibilities:
-- Manage order lifecycle
-- Add/remove items
-- Calculate totals
-- Validate orders
+- Manage order lifecycle with formal state machine
+- Add/remove items using CANONICAL IDs ONLY
+- Calculate totals with validation
+- Enforce immutability after confirmation
 - Prevent order tampering
-- Support rollback
+- Support safe rollback
+
+CRITICAL RULES:
+- All items must use canonical_id from menu_engine
+- State transitions are strictly enforced
+- CONFIRMED orders are IMMUTABLE
+- Price validation against menu required
+- Maximum order limits enforced
 """
 
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple, Set
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from enum import Enum
 from copy import deepcopy
 import uuid
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 
 class OrderState(Enum):
-    """Order lifecycle states."""
+    """
+    Order lifecycle states with strict transitions.
+    
+    State diagram:
+    EMPTY -> BUILDING -> REVIEWING -> CONFIRMED -> COMPLETED
+                 ↓         ↓           ↓
+              CANCELLED CANCELLED  CANCELLED
+    """
     EMPTY = "empty"
     BUILDING = "building"
-    CONFIRMING = "confirming"
-    FINALIZED = "finalized"
+    REVIEWING = "reviewing"  # AI presenting order for confirmation
+    CONFIRMED = "confirmed"  # Customer confirmed (IMMUTABLE after this)
+    COMPLETED = "completed"  # Order submitted to POS
     CANCELLED = "cancelled"
+    
+    def is_mutable(self) -> bool:
+        """Check if order can be modified in this state."""
+        return self in {OrderState.EMPTY, OrderState.BUILDING, OrderState.REVIEWING}
+    
+    def is_terminal(self) -> bool:
+        """Check if this is a terminal state."""
+        return self in {OrderState.COMPLETED, OrderState.CANCELLED}
+
+
+# Valid state transitions
+VALID_TRANSITIONS: Dict[OrderState, Set[OrderState]] = {
+    OrderState.EMPTY: {OrderState.BUILDING, OrderState.CANCELLED},
+    OrderState.BUILDING: {OrderState.REVIEWING, OrderState.EMPTY, OrderState.CANCELLED},
+    OrderState.REVIEWING: {OrderState.CONFIRMED, OrderState.BUILDING, OrderState.CANCELLED},
+    OrderState.CONFIRMED: {OrderState.COMPLETED, OrderState.CANCELLED},
+    OrderState.COMPLETED: set(),  # Terminal
+    OrderState.CANCELLED: set()   # Terminal
+}
 
 
 @dataclass
 class OrderItem:
-    """Single item in an order."""
+    """
+    Single item in an order.
     
-    item_id: str
-    name: str
-    price: float
+    CRITICAL: Uses canonical_id from menu_engine.
+    """
+    
+    canonical_id: str  # e.g., "FISH_COMBO"
+    name: str  # Display name (for readback)
+    price: float  # Validated against menu
     quantity: int = 1
+    modifications: List[str] = field(default_factory=list)
     notes: Optional[str] = None
+    
+    # Validation metadata
+    validated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
     def __post_init__(self):
         """Validate after initialization."""
+        if not self.canonical_id or not self.canonical_id.strip():
+            raise ValueError("canonical_id is required")
+        
         if self.quantity < 1:
             raise ValueError("Quantity must be at least 1")
+        
+        if self.quantity > 99:
+            raise ValueError("Quantity cannot exceed 99")
+        
         if self.price < 0:
             raise ValueError("Price cannot be negative")
+        
+        if self.price > 999.99:
+            raise ValueError("Price exceeds maximum ($999.99)")
     
     @property
     def subtotal(self) -> float:
@@ -57,26 +110,42 @@ class OrderItem:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
-            "item_id": self.item_id,
+            "canonical_id": self.canonical_id,
             "name": self.name,
             "price": self.price,
             "quantity": self.quantity,
+            "modifications": self.modifications,
             "notes": self.notes,
             "subtotal": self.subtotal
         }
 
 
+class StateTransitionError(Exception):
+    """Invalid state transition."""
+    pass
+
+
 class Order:
     """
-    Mutable order with state machine.
+    Transactional order with strict state machine.
     
     States:
     - EMPTY: No items
     - BUILDING: Adding/modifying items
-    - CONFIRMING: Ready for confirmation
-    - FINALIZED: Order confirmed
+    - REVIEWING: AI presenting for confirmation
+    - CONFIRMED: Customer confirmed (IMMUTABLE)
+    - COMPLETED: Submitted to POS
     - CANCELLED: Order cancelled
+    
+    SAFETY:
+    - State transitions validated
+    - CONFIRMED orders cannot be modified
+    - All items validated against menu
+    - Maximum item limits enforced
     """
+    
+    MAX_ITEMS = 20
+    MAX_TOTAL = 999.99
     
     def __init__(
         self,
@@ -93,22 +162,30 @@ class Order:
         self.order_id = order_id
         self.tenant_id = tenant_id
         
-        # State
+        # State machine
         self.state = OrderState.EMPTY
+        self._state_history: List[Tuple[OrderState, datetime]] = [
+            (OrderState.EMPTY, datetime.now(timezone.utc))
+        ]
+        
+        # Items
         self.items: List[OrderItem] = []
         
         # Metadata
         self.created_at = datetime.now(timezone.utc)
         self.updated_at = self.created_at
-        self.finalized_at: Optional[datetime] = None
+        self.confirmed_at: Optional[datetime] = None
+        self.completed_at: Optional[datetime] = None
         
-        # Customer info (set when finalizing)
+        # Customer info
         self.customer_name: Optional[str] = None
         self.customer_phone: Optional[str] = None
-        self.customer_email: Optional[str] = None
         
         # Snapshot for rollback
         self._snapshot: Optional[List[OrderItem]] = None
+        
+        # Validation
+        self._validated_canonical_ids: Set[str] = set()
         
         logger.info(
             "Order created",
@@ -118,33 +195,91 @@ class Order:
             }
         )
     
+    def _transition_state(self, new_state: OrderState) -> None:
+        """
+        Transition to new state with validation.
+        
+        Args:
+            new_state: Target state
+            
+        Raises:
+            StateTransitionError: If transition is invalid
+        """
+        # Check if transition is valid
+        valid_targets = VALID_TRANSITIONS.get(self.state, set())
+        
+        if new_state not in valid_targets:
+            raise StateTransitionError(
+                f"Invalid transition: {self.state.value} -> {new_state.value}"
+            )
+        
+        old_state = self.state
+        self.state = new_state
+        self._state_history.append((new_state, datetime.now(timezone.utc)))
+        
+        logger.info(
+            f"Order state transition: {old_state.value} -> {new_state.value}",
+            extra={"order_id": self.order_id}
+        )
+    
+    def _check_mutable(self) -> None:
+        """
+        Check if order can be modified.
+        
+        Raises:
+            ValueError: If order is immutable
+        """
+        if not self.state.is_mutable():
+            raise ValueError(
+                f"Cannot modify order in {self.state.value} state"
+            )
+    
     def add_item(
         self,
-        item_id: str,
+        canonical_id: str,
         name: str,
         price: float,
         quantity: int = 1,
-        notes: Optional[str] = None
+        modifications: Optional[List[str]] = None,
+        notes: Optional[str] = None,
+        validated: bool = False
     ) -> None:
         """
-        Add item to order.
+        Add item to order using canonical ID.
         
         Args:
-            item_id: Item identifier
-            name: Item name
-            price: Item price
+            canonical_id: Canonical item ID from menu
+            name: Display name
+            price: Item price (must match menu)
             quantity: Quantity
+            modifications: Modifications list
             notes: Optional notes
+            validated: Whether item was validated against menu
+            
+        Raises:
+            ValueError: If order cannot be modified or limits exceeded
         """
-        if self.is_finalized():
-            raise ValueError("Cannot modify finalized order")
+        self._check_mutable()
+        
+        # Check item limit
+        if len(self.items) >= self.MAX_ITEMS:
+            raise ValueError(f"Cannot exceed {self.MAX_ITEMS} items")
+        
+        # Track validated canonical IDs
+        if validated:
+            self._validated_canonical_ids.add(canonical_id)
         
         # Check if item already exists
         for existing in self.items:
-            if existing.item_id == item_id:
+            if existing.canonical_id == canonical_id:
                 # Update quantity
-                existing.quantity += quantity
+                new_qty = existing.quantity + quantity
+                if new_qty > 99:
+                    raise ValueError("Item quantity cannot exceed 99")
+                
+                existing.quantity = new_qty
                 self._mark_updated()
+                
                 logger.info(
                     f"Item quantity updated: {name} x{existing.quantity}",
                     extra={"order_id": self.order_id}
@@ -153,10 +288,11 @@ class Order:
         
         # Add new item
         item = OrderItem(
-            item_id=item_id,
+            canonical_id=canonical_id,
             name=name,
             price=price,
             quantity=quantity,
+            modifications=modifications or [],
             notes=notes
         )
         
@@ -165,37 +301,39 @@ class Order:
         
         # Transition from EMPTY to BUILDING
         if self.state == OrderState.EMPTY:
-            self.state = OrderState.BUILDING
+            self._transition_state(OrderState.BUILDING)
         
         logger.info(
-            f"Item added: {name} x{quantity}",
+            f"Item added: {canonical_id} ({name}) x{quantity}",
             extra={"order_id": self.order_id}
         )
     
-    def remove_item(self, item_id: str) -> bool:
+    def remove_item(self, canonical_id: str) -> bool:
         """
-        Remove item from order.
+        Remove item by canonical ID.
         
         Args:
-            item_id: Item to remove
+            canonical_id: Canonical item ID
             
         Returns:
             True if removed
+            
+        Raises:
+            ValueError: If order cannot be modified
         """
-        if self.is_finalized():
-            raise ValueError("Cannot modify finalized order")
+        self._check_mutable()
         
         for i, item in enumerate(self.items):
-            if item.item_id == item_id:
+            if item.canonical_id == canonical_id:
                 removed = self.items.pop(i)
                 self._mark_updated()
                 
                 # Transition to EMPTY if no items
-                if not self.items:
-                    self.state = OrderState.EMPTY
+                if not self.items and self.state == OrderState.BUILDING:
+                    self._transition_state(OrderState.EMPTY)
                 
                 logger.info(
-                    f"Item removed: {removed.name}",
+                    f"Item removed: {canonical_id} ({removed.name})",
                     extra={"order_id": self.order_id}
                 )
                 return True
@@ -204,33 +342,34 @@ class Order:
     
     def update_quantity(
         self,
-        item_id: str,
+        canonical_id: str,
         quantity: int
     ) -> bool:
         """
         Update item quantity.
         
         Args:
-            item_id: Item to update
-            quantity: New quantity
+            canonical_id: Canonical item ID
+            quantity: New quantity (0 to remove)
             
         Returns:
             True if updated
         """
-        if self.is_finalized():
-            raise ValueError("Cannot modify finalized order")
+        self._check_mutable()
         
-        if quantity < 1:
-            # Remove if quantity is 0
-            return self.remove_item(item_id)
+        if quantity < 0 or quantity > 99:
+            raise ValueError("Quantity must be 0-99")
+        
+        if quantity == 0:
+            return self.remove_item(canonical_id)
         
         for item in self.items:
-            if item.item_id == item_id:
+            if item.canonical_id == canonical_id:
                 item.quantity = quantity
                 self._mark_updated()
                 
                 logger.info(
-                    f"Quantity updated: {item.name} x{quantity}",
+                    f"Quantity updated: {canonical_id} x{quantity}",
                     extra={"order_id": self.order_id}
                 )
                 return True
@@ -239,11 +378,14 @@ class Order:
     
     def clear(self) -> None:
         """Clear all items."""
-        if self.is_finalized():
-            raise ValueError("Cannot modify finalized order")
+        self._check_mutable()
         
         self.items.clear()
-        self.state = OrderState.EMPTY
+        self._validated_canonical_ids.clear()
+        
+        if self.state == OrderState.BUILDING:
+            self._transition_state(OrderState.EMPTY)
+        
         self._mark_updated()
         
         logger.info(
@@ -255,7 +397,7 @@ class Order:
         """Create snapshot for rollback."""
         self._snapshot = deepcopy(self.items)
         logger.debug(
-            "Snapshot created",
+            f"Snapshot created ({len(self.items)} items)",
             extra={"order_id": self.order_id}
         )
     
@@ -269,6 +411,8 @@ class Order:
         if self._snapshot is None:
             return False
         
+        self._check_mutable()
+        
         self.items = deepcopy(self._snapshot)
         self._mark_updated()
         
@@ -278,111 +422,144 @@ class Order:
         )
         return True
     
-    def mark_confirming(self) -> None:
-        """Mark order as confirming (ready for review)."""
-        if self.state == OrderState.EMPTY:
-            raise ValueError("Cannot confirm empty order")
+    def start_review(self) -> None:
+        """Mark order for customer review."""
+        if self.is_empty():
+            raise ValueError("Cannot review empty order")
         
-        if self.is_finalized():
-            raise ValueError("Order already finalized")
+        if self.state != OrderState.BUILDING:
+            raise StateTransitionError(
+                f"Can only start review from BUILDING state, not {self.state.value}"
+            )
         
-        self.state = OrderState.CONFIRMING
-        logger.info(
-            "Order marked for confirmation",
-            extra={"order_id": self.order_id}
-        )
+        # Validate total
+        if self.get_total() > self.MAX_TOTAL:
+            raise ValueError(f"Order total exceeds maximum (${self.MAX_TOTAL})")
+        
+        self._transition_state(OrderState.REVIEWING)
     
-    def finalize(
+    def return_to_building(self) -> None:
+        """Return to building from review."""
+        if self.state != OrderState.REVIEWING:
+            raise StateTransitionError(
+                f"Can only return to building from REVIEWING state"
+            )
+        
+        self._transition_state(OrderState.BUILDING)
+    
+    def confirm(
         self,
         customer_name: Optional[str] = None,
-        customer_phone: Optional[str] = None,
-        customer_email: Optional[str] = None
+        customer_phone: Optional[str] = None
     ) -> None:
         """
-        Finalize order (make immutable).
+        Confirm order (makes IMMUTABLE).
         
         Args:
             customer_name: Customer name
             customer_phone: Customer phone
-            customer_email: Customer email
+            
+        Raises:
+            ValueError: If order cannot be confirmed
+            StateTransitionError: If not in REVIEWING state
         """
-        if self.state == OrderState.EMPTY:
-            raise ValueError("Cannot finalize empty order")
+        if self.is_empty():
+            raise ValueError("Cannot confirm empty order")
         
-        if self.is_finalized():
-            raise ValueError("Order already finalized")
+        if self.state != OrderState.REVIEWING:
+            raise StateTransitionError(
+                f"Can only confirm from REVIEWING state, not {self.state.value}"
+            )
         
-        self.state = OrderState.FINALIZED
-        self.finalized_at = datetime.now(timezone.utc)
+        # Final validation
+        if self.get_total() > self.MAX_TOTAL:
+            raise ValueError(f"Order total exceeds maximum (${self.MAX_TOTAL})")
+        
+        self._transition_state(OrderState.CONFIRMED)
+        self.confirmed_at = datetime.now(timezone.utc)
         
         # Set customer info
         self.customer_name = customer_name
         self.customer_phone = customer_phone
-        self.customer_email = customer_email
         
         logger.info(
-            "Order finalized",
+            f"Order CONFIRMED (IMMUTABLE): {self.get_item_count()} items, ${self.get_total():.2f}",
             extra={
                 "order_id": self.order_id,
                 "total": self.get_total()
             }
         )
     
-    def cancel(self) -> None:
-        """Cancel order."""
-        if self.state == OrderState.FINALIZED:
-            logger.warning(
-                "Cancelling finalized order",
-                extra={"order_id": self.order_id}
+    def complete(self) -> None:
+        """Mark order as completed (submitted to POS)."""
+        if self.state != OrderState.CONFIRMED:
+            raise StateTransitionError(
+                "Can only complete CONFIRMED orders"
             )
         
-        self.state = OrderState.CANCELLED
+        self._transition_state(OrderState.COMPLETED)
+        self.completed_at = datetime.now(timezone.utc)
+        
         logger.info(
-            "Order cancelled",
+            "Order completed",
+            extra={"order_id": self.order_id}
+        )
+    
+    def cancel(self, reason: str = "user_requested") -> None:
+        """
+        Cancel order.
+        
+        Args:
+            reason: Cancellation reason
+        """
+        if self.state.is_terminal():
+            raise ValueError(f"Cannot cancel {self.state.value} order")
+        
+        self._transition_state(OrderState.CANCELLED)
+        
+        logger.info(
+            f"Order cancelled: {reason}",
             extra={"order_id": self.order_id}
         )
     
     def get_total(self) -> float:
-        """
-        Calculate order total.
-        
-        Returns:
-            Total price
-        """
+        """Calculate order total."""
         return round(sum(item.subtotal for item in self.items), 2)
     
     def get_item_count(self) -> int:
-        """
-        Get total item count.
-        
-        Returns:
-            Number of items
-        """
+        """Get total item count."""
         return sum(item.quantity for item in self.items)
     
     def is_empty(self) -> bool:
         """Check if order is empty."""
         return len(self.items) == 0
     
-    def is_finalized(self) -> bool:
-        """Check if order is finalized."""
-        return self.state == OrderState.FINALIZED
+    def is_confirmed(self) -> bool:
+        """Check if order is confirmed (immutable)."""
+        return self.state == OrderState.CONFIRMED
     
-    def is_cancelled(self) -> bool:
-        """Check if order is cancelled."""
-        return self.state == OrderState.CANCELLED
+    def is_terminal(self) -> bool:
+        """Check if in terminal state."""
+        return self.state.is_terminal()
+    
+    def get_unvalidated_items(self) -> List[str]:
+        """
+        Get list of canonical IDs that weren't validated against menu.
+        
+        Returns:
+            List of unvalidated canonical IDs
+        """
+        return [
+            item.canonical_id for item in self.items
+            if item.canonical_id not in self._validated_canonical_ids
+        ]
     
     def _mark_updated(self) -> None:
         """Mark order as updated."""
         self.updated_at = datetime.now(timezone.utc)
     
     def get_summary(self) -> Dict[str, Any]:
-        """
-        Get order summary.
-        
-        Returns:
-            Summary dictionary
-        """
+        """Get order summary."""
         return {
             "order_id": self.order_id,
             "tenant_id": self.tenant_id,
@@ -392,15 +569,17 @@ class Order:
             "total": self.get_total(),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
-            "finalized_at": (
-                self.finalized_at.isoformat()
-                if self.finalized_at
+            "confirmed_at": (
+                self.confirmed_at.isoformat()
+                if self.confirmed_at
                 else None
             ),
             "customer": {
                 "name": self.customer_name,
-                "phone": self.customer_phone,
-                "email": self.customer_email
+                "phone": self.customer_phone
+            },
+            "validation": {
+                "unvalidated_items": self.get_unvalidated_items()
             }
         }
     
@@ -411,14 +590,20 @@ class Order:
 
 class OrderEngine:
     """
-    Order management engine.
+    Order management engine with validation.
     
-    Manages active orders per call.
+    Manages active orders per call with menu validation.
     """
     
-    def __init__(self):
-        """Initialize order engine."""
+    def __init__(self, menu_engine=None):
+        """
+        Initialize order engine.
+        
+        Args:
+            menu_engine: Optional MenuEngine for validation
+        """
         self._orders: Dict[str, Order] = {}
+        self.menu_engine = menu_engine
         
         logger.info("OrderEngine initialized")
     
@@ -428,7 +613,7 @@ class OrderEngine:
         tenant_id: str
     ) -> Order:
         """
-        Create new order.
+        Create new order for call.
         
         Args:
             call_id: Call identifier
@@ -453,27 +638,11 @@ class OrderEngine:
         return order
     
     def get_order(self, call_id: str) -> Optional[Order]:
-        """
-        Get order for call.
-        
-        Args:
-            call_id: Call identifier
-            
-        Returns:
-            Order or None
-        """
+        """Get order for call."""
         return self._orders.get(call_id)
     
     def delete_order(self, call_id: str) -> bool:
-        """
-        Delete order.
-        
-        Args:
-            call_id: Call identifier
-            
-        Returns:
-            True if deleted
-        """
+        """Delete order."""
         if call_id in self._orders:
             del self._orders[call_id]
             logger.info(
@@ -483,17 +652,66 @@ class OrderEngine:
             return True
         return False
     
-    def get_active_orders(self) -> Dict[str, Order]:
-        """Get all active orders."""
-        return self._orders.copy()
+    async def validate_order(
+        self,
+        order: Order
+    ) -> Tuple[bool, List[str]]:
+        """
+        Validate all items in order against menu.
+        
+        Args:
+            order: Order to validate
+            
+        Returns:
+            Tuple of (is_valid, error_messages)
+        """
+        if not self.menu_engine:
+            logger.warning("No menu_engine - skipping validation")
+            return True, []
+        
+        errors = []
+        
+        for item in order.items:
+            # Validate item exists
+            exists = await self.menu_engine.validate_item_exists(
+                order.tenant_id,
+                item.canonical_id
+            )
+            
+            if not exists:
+                errors.append(
+                    f"Item {item.canonical_id} does not exist in menu"
+                )
+                continue
+            
+            # Validate price
+            is_valid, actual_price = await self.menu_engine.validate_price(
+                order.tenant_id,
+                item.canonical_id,
+                item.price
+            )
+            
+            if not is_valid and actual_price is not None:
+                errors.append(
+                    f"Price mismatch for {item.canonical_id}: "
+                    f"expected ${item.price:.2f}, actual ${actual_price:.2f}"
+                )
+        
+        is_valid = len(errors) == 0
+        
+        if not is_valid:
+            logger.warning(
+                f"Order validation failed: {len(errors)} errors",
+                extra={
+                    "order_id": order.order_id,
+                    "errors": errors
+                }
+            )
+        
+        return is_valid, errors
     
     def get_stats(self) -> Dict[str, Any]:
-        """
-        Get engine statistics.
-        
-        Returns:
-            Statistics dictionary
-        """
+        """Get engine statistics."""
         states = {}
         total_value = 0.0
         
@@ -505,7 +723,7 @@ class OrderEngine:
         return {
             "active_orders": len(self._orders),
             "orders_by_state": states,
-            "total_value": total_value
+            "total_value": round(total_value, 2)
         }
 
 
@@ -514,12 +732,7 @@ _default_engine: Optional[OrderEngine] = None
 
 
 def get_default_engine() -> OrderEngine:
-    """
-    Get or create default order engine.
-    
-    Returns:
-        Default engine instance
-    """
+    """Get or create default order engine."""
     global _default_engine
     
     if _default_engine is None:
@@ -528,30 +741,8 @@ def get_default_engine() -> OrderEngine:
     return _default_engine
 
 
-def create_order(call_id: str, tenant_id: str) -> Order:
-    """
-    Quick order creation.
-    
-    Args:
-        call_id: Call identifier
-        tenant_id: Tenant identifier
-        
-    Returns:
-        Created order
-    """
-    engine = get_default_engine()
-    return engine.create_order(call_id, tenant_id)
-
-
-def get_order(call_id: str) -> Optional[Order]:
-    """
-    Quick order retrieval.
-    
-    Args:
-        call_id: Call identifier
-        
-    Returns:
-        Order or None
-    """
-    engine = get_default_engine()
-    return engine.get_order(call_id)
+def set_default_engine(engine: OrderEngine) -> None:
+    """Set default engine."""
+    global _default_engine
+    _default_engine = engine
+    logger.info("Default order engine set")
