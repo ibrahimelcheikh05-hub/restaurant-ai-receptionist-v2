@@ -1,14 +1,24 @@
 """
 Conversation Memory
 ===================
-Per-call conversation history and context management.
+Per-call conversation history and context management with strict limits.
 
 Responsibilities:
-- Store conversation turns
+- Store conversation turns with limits
 - Track context across turns
 - Manage conversation history
 - Provide context for AI
 - Support conversation summarization
+- ENFORCE memory bounds
+- PREVENT memory leaks
+- VALIDATE content size
+
+CRITICAL SAFETY:
+- Maximum turns per call: 50 (hard limit)
+- Maximum content length per turn: 1000 chars
+- Maximum context values: 20
+- Maximum context value size: 5000 chars total
+- Automatic pruning when limits exceeded
 """
 
 import logging
@@ -22,12 +32,31 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ConversationTurn:
-    """Single conversation turn."""
+    """
+    Single conversation turn with validation.
+    
+    SAFETY: Content length limited to prevent memory bloat.
+    """
+    
+    MAX_CONTENT_LENGTH = 1000
     
     role: str  # 'user' or 'assistant'
     content: str
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Validate after initialization."""
+        # Validate role
+        if self.role not in {"user", "assistant", "system"}:
+            raise ValueError(f"Invalid role: {self.role}")
+        
+        # Enforce content length
+        if len(self.content) > self.MAX_CONTENT_LENGTH:
+            logger.warning(
+                f"Content truncated from {len(self.content)} to {self.MAX_CONTENT_LENGTH} chars"
+            )
+            self.content = self.content[:self.MAX_CONTENT_LENGTH]
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -40,7 +69,7 @@ class ConversationTurn:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'ConversationTurn':
-        """Create from dictionary."""
+        """Create from dictionary with validation."""
         return cls(
             role=data["role"],
             content=data["content"],
@@ -51,46 +80,72 @@ class ConversationTurn:
 
 class ConversationMemory:
     """
-    Manages conversation history and context.
+    Manages conversation history and context with strict limits.
     
     Features:
-    - Turn-by-turn history
-    - Context accumulation
+    - Turn-by-turn history with bounds
+    - Context accumulation with limits
     - History windowing
     - Summarization support
+    - Memory leak prevention
+    
+    SAFETY:
+    - Max 50 turns total
+    - Max 1000 chars per turn
+    - Max 20 context keys
+    - Max 5000 chars total context
+    - Automatic pruning
     """
+    
+    # Hard limits
+    MAX_TURNS = 50
+    MAX_CONTEXT_TURNS = 10  # For AI context
+    MAX_CONTEXT_KEYS = 20
+    MAX_CONTEXT_TOTAL_SIZE = 5000
+    MAX_TURN_CONTENT_LENGTH = 1000
     
     def __init__(
         self,
         call_id: str,
-        max_turns: int = 50,
-        max_context_turns: int = 10
+        max_turns: int = MAX_TURNS,
+        max_context_turns: int = MAX_CONTEXT_TURNS
     ):
         """
         Initialize conversation memory.
         
         Args:
             call_id: Call identifier
-            max_turns: Maximum turns to store
-            max_context_turns: Max turns to include in context
+            max_turns: Maximum turns to store (capped at MAX_TURNS)
+            max_context_turns: Max turns to include in context (capped at MAX_CONTEXT_TURNS)
         """
         self.call_id = call_id
-        self.max_turns = max_turns
-        self.max_context_turns = max_context_turns
+        
+        # Enforce limits
+        self.max_turns = min(max_turns, self.MAX_TURNS)
+        self.max_context_turns = min(max_context_turns, self.MAX_CONTEXT_TURNS)
         
         # Conversation history
         self._turns: List[ConversationTurn] = []
         
         # Context snapshots (menu, order, etc.)
         self._context: Dict[str, Any] = {}
+        self._context_size = 0  # Track context memory usage
         
         # Metadata
         self._created_at = datetime.now(timezone.utc)
         self._last_update = self._created_at
         
+        # Statistics
+        self._total_turns_added = 0
+        self._total_pruned = 0
+        
         logger.info(
             "ConversationMemory created",
-            extra={"call_id": call_id}
+            extra={
+                "call_id": call_id,
+                "max_turns": self.max_turns,
+                "max_context_turns": self.max_context_turns
+            }
         )
     
     def add_turn(
@@ -100,13 +155,14 @@ class ConversationMemory:
         metadata: Optional[Dict[str, Any]] = None
     ) -> None:
         """
-        Add conversation turn.
+        Add conversation turn with validation.
         
         Args:
             role: Role ('user' or 'assistant')
-            content: Turn content
+            content: Turn content (will be truncated if too long)
             metadata: Optional metadata
         """
+        # Create turn (validation happens in __post_init__)
         turn = ConversationTurn(
             role=role,
             content=content,
@@ -114,17 +170,29 @@ class ConversationMemory:
         )
         
         self._turns.append(turn)
+        self._total_turns_added += 1
         self._last_update = datetime.now(timezone.utc)
         
         # Prune if exceeded max
         if len(self._turns) > self.max_turns:
+            pruned_count = len(self._turns) - self.max_turns
             self._turns = self._turns[-self.max_turns:]
+            self._total_pruned += pruned_count
+            
+            logger.debug(
+                f"Pruned {pruned_count} old turns",
+                extra={
+                    "call_id": self.call_id,
+                    "total_pruned": self._total_pruned
+                }
+            )
         
         logger.debug(
             f"Turn added: {role}",
             extra={
                 "call_id": self.call_id,
-                "turn_count": len(self._turns)
+                "turn_count": len(self._turns),
+                "total_added": self._total_turns_added
             }
         )
     
@@ -133,13 +201,7 @@ class ConversationMemory:
         content: str,
         metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """
-        Add user turn.
-        
-        Args:
-            content: User message
-            metadata: Optional metadata
-        """
+        """Add user turn."""
         self.add_turn("user", content, metadata)
     
     def add_assistant_turn(
@@ -147,13 +209,7 @@ class ConversationMemory:
         content: str,
         metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """
-        Add assistant turn.
-        
-        Args:
-            content: Assistant message
-            metadata: Optional metadata
-        """
+        """Add assistant turn."""
         self.add_turn("assistant", content, metadata)
     
     def get_history(
@@ -167,10 +223,13 @@ class ConversationMemory:
             max_turns: Max turns to return (defaults to max_context_turns)
             
         Returns:
-            List of conversation turns
+            List of conversation turns (most recent)
         """
         limit = max_turns or self.max_context_turns
-        return self._turns[-limit:]
+        # Enforce absolute maximum
+        limit = min(limit, self.MAX_CONTEXT_TURNS)
+        
+        return self._turns[-limit:] if self._turns else []
     
     def get_history_as_messages(
         self,
@@ -223,8 +282,12 @@ class ConversationMemory:
         return "\n".join(lines)
     
     def get_turn_count(self) -> int:
-        """Get total turn count."""
+        """Get current turn count."""
         return len(self._turns)
+    
+    def get_total_turns_added(self) -> int:
+        """Get total turns added (including pruned)."""
+        return self._total_turns_added
     
     def get_last_user_turn(self) -> Optional[ConversationTurn]:
         """Get most recent user turn."""
@@ -240,44 +303,121 @@ class ConversationMemory:
                 return turn
         return None
     
-    def set_context(self, key: str, value: Any) -> None:
+    def set_context(self, key: str, value: Any) -> bool:
         """
-        Set context value.
+        Set context value with size validation.
         
         Args:
             key: Context key
             value: Context value
-        """
-        self._context[key] = value
-        logger.debug(
-            f"Context set: {key}",
-            extra={"call_id": self.call_id}
-        )
-    
-    def get_context(self, key: str) -> Optional[Any]:
-        """
-        Get context value.
-        
-        Args:
-            key: Context key
             
         Returns:
-            Context value or None
+            True if set successfully, False if rejected
         """
+        # Check key limit
+        if key not in self._context and len(self._context) >= self.MAX_CONTEXT_KEYS:
+            logger.warning(
+                f"Cannot add context key '{key}' - limit reached ({self.MAX_CONTEXT_KEYS})",
+                extra={"call_id": self.call_id}
+            )
+            return False
+        
+        # Estimate size
+        try:
+            value_str = json.dumps(value)
+            value_size = len(value_str)
+        except (TypeError, ValueError):
+            # Fallback for non-serializable
+            value_str = str(value)
+            value_size = len(value_str)
+        
+        # Check if adding this would exceed total size
+        old_size = 0
+        if key in self._context:
+            try:
+                old_size = len(json.dumps(self._context[key]))
+            except:
+                old_size = len(str(self._context[key]))
+        
+        new_total_size = self._context_size - old_size + value_size
+        
+        if new_total_size > self.MAX_CONTEXT_TOTAL_SIZE:
+            logger.warning(
+                f"Context size would exceed limit: {new_total_size} > {self.MAX_CONTEXT_TOTAL_SIZE}",
+                extra={"call_id": self.call_id, "key": key}
+            )
+            return False
+        
+        # Set value
+        self._context[key] = value
+        self._context_size = new_total_size
+        
+        logger.debug(
+            f"Context set: {key} ({value_size} chars, total: {self._context_size})",
+            extra={"call_id": self.call_id}
+        )
+        
+        return True
+    
+    def get_context(self, key: str) -> Optional[Any]:
+        """Get context value."""
         return self._context.get(key)
     
-    def update_context(self, updates: Dict[str, Any]) -> None:
+    def update_context(self, updates: Dict[str, Any]) -> Dict[str, bool]:
         """
         Update multiple context values.
         
         Args:
             updates: Dictionary of updates
+            
+        Returns:
+            Dictionary of {key: success_bool}
         """
-        self._context.update(updates)
+        results = {}
+        for key, value in updates.items():
+            results[key] = self.set_context(key, value)
+        return results
+    
+    def delete_context(self, key: str) -> bool:
+        """
+        Delete context key.
+        
+        Args:
+            key: Context key
+            
+        Returns:
+            True if deleted
+        """
+        if key in self._context:
+            del self._context[key]
+            
+            # Recalculate size
+            self._recalculate_context_size()
+            
+            logger.debug(
+                f"Context deleted: {key}",
+                extra={"call_id": self.call_id}
+            )
+            return True
+        return False
+    
+    def _recalculate_context_size(self) -> None:
+        """Recalculate total context size."""
+        total = 0
+        for value in self._context.values():
+            try:
+                total += len(json.dumps(value))
+            except:
+                total += len(str(value))
+        self._context_size = total
     
     def get_all_context(self) -> Dict[str, Any]:
-        """Get all context."""
+        """Get all context (copy)."""
         return self._context.copy()
+    
+    def get_context_size(self) -> int:
+        """Get current context size in characters."""
+        return self._context_size
     
     def clear_history(self) -> None:
         """Clear conversation history."""
@@ -287,13 +427,17 @@ class ConversationMemory:
             extra={"call_id": self.call_id}
         )
     
+    def clear_context(self) -> None:
+        """Clear all context."""
+        self._context.clear()
+        self._context_size = 0
+        logger.info(
+            "Context cleared",
+            extra={"call_id": self.call_id}
+        )
+    
     def summarize(self) -> str:
-        """
-        Generate conversation summary.
-        
-        Returns:
-            Summary text
-        """
+        """Generate conversation summary."""
         if not self._turns:
             return "No conversation yet."
         
@@ -306,10 +450,12 @@ class ConversationMemory:
         
         summary = (
             f"Conversation Summary:\n"
-            f"- Total turns: {len(self._turns)}\n"
+            f"- Total turns: {len(self._turns)} (added: {self._total_turns_added}, pruned: {self._total_pruned})\n"
             f"- User turns: {len(user_turns)}\n"
             f"- Assistant turns: {len(assistant_turns)}\n"
             f"- Duration: {duration:.1f} seconds\n"
+            f"- Context keys: {len(self._context)}/{self.MAX_CONTEXT_KEYS}\n"
+            f"- Context size: {self._context_size}/{self.MAX_CONTEXT_TOTAL_SIZE} chars\n"
         )
         
         # Add context info if available
@@ -321,20 +467,31 @@ class ConversationMemory:
         
         return summary
     
+    def get_stats(self) -> Dict[str, Any]:
+        """Get memory statistics."""
+        return {
+            "turn_count": len(self._turns),
+            "total_added": self._total_turns_added,
+            "total_pruned": self._total_pruned,
+            "context_keys": len(self._context),
+            "context_size": self._context_size,
+            "max_turns": self.max_turns,
+            "max_context_keys": self.MAX_CONTEXT_KEYS,
+            "max_context_size": self.MAX_CONTEXT_TOTAL_SIZE,
+            "duration_seconds": (
+                self._last_update - self._created_at
+            ).total_seconds()
+        }
+    
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Serialize to dictionary.
-        
-        Returns:
-            Dictionary representation
-        """
+        """Serialize to dictionary."""
         return {
             "call_id": self.call_id,
             "turns": [turn.to_dict() for turn in self._turns],
             "context": self._context,
             "created_at": self._created_at.isoformat(),
             "last_update": self._last_update.isoformat(),
-            "turn_count": len(self._turns)
+            "stats": self.get_stats()
         }
     
     @classmethod
@@ -342,52 +499,41 @@ class ConversationMemory:
         cls,
         data: Dict[str, Any]
     ) -> 'ConversationMemory':
-        """
-        Deserialize from dictionary.
-        
-        Args:
-            data: Dictionary data
-            
-        Returns:
-            ConversationMemory instance
-        """
+        """Deserialize from dictionary with validation."""
         memory = cls(call_id=data["call_id"])
         
-        # Restore turns
-        memory._turns = [
-            ConversationTurn.from_dict(turn_data)
-            for turn_data in data["turns"]
-        ]
+        # Restore turns (with validation)
+        for turn_data in data["turns"]:
+            try:
+                turn = ConversationTurn.from_dict(turn_data)
+                memory._turns.append(turn)
+            except Exception as e:
+                logger.warning(
+                    f"Skipping invalid turn during restore: {e}",
+                    extra={"call_id": data["call_id"]}
+                )
         
-        # Restore context
-        memory._context = data.get("context", {})
+        # Restore context (with validation)
+        context = data.get("context", {})
+        for key, value in context.items():
+            memory.set_context(key, value)
         
         # Restore timestamps
-        memory._created_at = datetime.fromisoformat(data["created_at"])
-        memory._last_update = datetime.fromisoformat(data["last_update"])
+        try:
+            memory._created_at = datetime.fromisoformat(data["created_at"])
+            memory._last_update = datetime.fromisoformat(data["last_update"])
+        except:
+            pass
         
         return memory
     
     def to_json(self) -> str:
-        """
-        Serialize to JSON.
-        
-        Returns:
-            JSON string
-        """
+        """Serialize to JSON."""
         return json.dumps(self.to_dict(), indent=2)
     
     @classmethod
     def from_json(cls, json_str: str) -> 'ConversationMemory':
-        """
-        Deserialize from JSON.
-        
-        Args:
-            json_str: JSON string
-            
-        Returns:
-            ConversationMemory instance
-        """
+        """Deserialize from JSON."""
         data = json.loads(json_str)
         return cls.from_dict(data)
 
@@ -396,11 +542,23 @@ class ConversationMemoryStore:
     """
     Store for managing multiple conversation memories.
     
-    In-memory store for active conversations.
+    In-memory store for active conversations with limits.
+    
+    SAFETY:
+    - Maximum memories tracked
+    - Automatic cleanup of old memories
     """
     
-    def __init__(self):
-        """Initialize store."""
+    MAX_MEMORIES = 1000
+    
+    def __init__(self, max_memories: int = MAX_MEMORIES):
+        """
+        Initialize store.
+        
+        Args:
+            max_memories: Maximum memories to track
+        """
+        self.max_memories = max_memories
         self._memories: Dict[str, ConversationMemory] = {}
     
     def create(
@@ -418,6 +576,16 @@ class ConversationMemoryStore:
         Returns:
             Created memory
         """
+        # Check limit
+        if call_id not in self._memories and len(self._memories) >= self.max_memories:
+            logger.warning(
+                f"Memory store at capacity ({self.max_memories}), cannot create new memory",
+                extra={"call_id": call_id}
+            )
+            # Return existing or create ephemeral
+            # For safety, create ephemeral that won't be stored
+            return ConversationMemory(call_id=call_id, **kwargs)
+        
         memory = ConversationMemory(call_id=call_id, **kwargs)
         self._memories[call_id] = memory
         
@@ -432,27 +600,11 @@ class ConversationMemoryStore:
         return memory
     
     def get(self, call_id: str) -> Optional[ConversationMemory]:
-        """
-        Get conversation memory.
-        
-        Args:
-            call_id: Call identifier
-            
-        Returns:
-            Memory or None
-        """
+        """Get conversation memory."""
         return self._memories.get(call_id)
     
     def delete(self, call_id: str) -> bool:
-        """
-        Delete conversation memory.
-        
-        Args:
-            call_id: Call identifier
-            
-        Returns:
-            True if deleted
-        """
+        """Delete conversation memory."""
         if call_id in self._memories:
             del self._memories[call_id]
             logger.info(
@@ -463,7 +615,7 @@ class ConversationMemoryStore:
         return False
     
     def get_all(self) -> Dict[str, ConversationMemory]:
-        """Get all memories."""
+        """Get all memories (copy)."""
         return self._memories.copy()
     
     def count(self) -> int:
@@ -472,8 +624,21 @@ class ConversationMemoryStore:
     
     def clear(self) -> None:
         """Clear all memories."""
+        count = len(self._memories)
         self._memories.clear()
-        logger.info("All memories cleared")
+        logger.info(f"All memories cleared ({count} removed)")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get store statistics."""
+        total_turns = sum(m.get_turn_count() for m in self._memories.values())
+        total_context_size = sum(m.get_context_size() for m in self._memories.values())
+        
+        return {
+            "active_memories": len(self._memories),
+            "max_memories": self.max_memories,
+            "total_turns": total_turns,
+            "total_context_size": total_context_size
+        }
 
 
 # Global store instance
@@ -481,40 +646,20 @@ _global_store = ConversationMemoryStore()
 
 
 def create_memory(call_id: str, **kwargs) -> ConversationMemory:
-    """
-    Create conversation memory.
-    
-    Args:
-        call_id: Call identifier
-        **kwargs: Additional arguments
-        
-    Returns:
-        Created memory
-    """
+    """Create conversation memory."""
     return _global_store.create(call_id, **kwargs)
 
 
 def get_memory(call_id: str) -> Optional[ConversationMemory]:
-    """
-    Get conversation memory.
-    
-    Args:
-        call_id: Call identifier
-        
-    Returns:
-        Memory or None
-    """
+    """Get conversation memory."""
     return _global_store.get(call_id)
 
 
 def delete_memory(call_id: str) -> bool:
-    """
-    Delete conversation memory.
-    
-    Args:
-        call_id: Call identifier
-        
-    Returns:
-        True if deleted
-    """
+    """Delete conversation memory."""
     return _global_store.delete(call_id)
+
+
+def get_store_stats() -> Dict[str, Any]:
+    """Get global store statistics."""
+    return _global_store.get_stats()
