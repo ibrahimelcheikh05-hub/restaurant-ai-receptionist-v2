@@ -9,14 +9,19 @@ Responsibilities:
 - Bridge Twilio WebSocket to CallController
 - Handle call lifecycle via Vocode
 - Maintain call registry
+- ENFORCE concurrency limits
+- ENFORCE resource limits
+- REJECT overload conditions
+- Graceful shutdown with forced termination
 
 This is the HTTP/WebSocket entry point.
 """
 
 import asyncio
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Callable, Any
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, Request, Response, Form, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -27,38 +32,116 @@ from vocode.streaming.telephony.config_manager.base_config_manager import BaseCo
 from vocode.streaming.telephony.templater import get_connection_twiml
 from vocode.streaming.utils import create_conversation_id
 
-from core.call_controller import CallController
-from core.session import SessionConfig
-from core.watchdog import WatchdogLimits
+from call_controller import CallController
+from watchdog import WatchdogLimits
 
 logger = logging.getLogger(__name__)
 
 
 class CallRegistry:
-    """Thread-safe registry of active calls."""
+    """
+    Thread-safe registry of active calls with resource limits.
     
-    def __init__(self):
+    Features:
+    - Atomic registration/unregistration
+    - Concurrent call limits
+    - Safe iteration
+    - Cleanup enforcement
+    - Admission control
+    """
+    
+    def __init__(self, max_concurrent_calls: int = 100):
+        """
+        Initialize call registry.
+        
+        Args:
+            max_concurrent_calls: Maximum concurrent calls allowed
+        """
         self._calls: Dict[str, CallController] = {}
         self._lock = asyncio.Lock()
+        self.max_concurrent_calls = max_concurrent_calls
+        
+        # Metrics
+        self._total_registered = 0
+        self._total_rejected = 0
+        
+        logger.info(
+            "CallRegistry initialized",
+            extra={"max_concurrent": max_concurrent_calls}
+        )
     
-    async def register(self, call_id: str, controller: CallController) -> None:
-        """Register a call controller."""
+    async def register(
+        self,
+        call_id: str,
+        controller: CallController
+    ) -> bool:
+        """
+        Register a call controller with admission control.
+        
+        Args:
+            call_id: Call identifier
+            controller: Call controller instance
+            
+        Returns:
+            True if registered, False if rejected (over limit)
+        """
         async with self._lock:
+            # Check limit
+            if len(self._calls) >= self.max_concurrent_calls:
+                self._total_rejected += 1
+                logger.error(
+                    "Max concurrent calls reached - rejecting call",
+                    extra={
+                        "call_id": call_id,
+                        "current": len(self._calls),
+                        "max": self.max_concurrent_calls,
+                        "total_rejected": self._total_rejected
+                    }
+                )
+                return False
+            
+            # Check for duplicate
+            if call_id in self._calls:
+                logger.warning(
+                    "Call ID already registered",
+                    extra={"call_id": call_id}
+                )
+                return False
+            
+            # Register
             self._calls[call_id] = controller
+            self._total_registered += 1
             logger.info(
                 f"Call registered: {call_id}",
-                extra={"total_calls": len(self._calls)}
+                extra={
+                    "call_id": call_id,
+                    "total_calls": len(self._calls),
+                    "total_registered": self._total_registered
+                }
             )
+            return True
     
-    async def unregister(self, call_id: str) -> None:
-        """Unregister a call controller."""
+    async def unregister(self, call_id: str) -> Optional[CallController]:
+        """
+        Unregister a call controller.
+        
+        Args:
+            call_id: Call identifier
+            
+        Returns:
+            Controller if it was registered, None otherwise
+        """
         async with self._lock:
-            if call_id in self._calls:
-                del self._calls[call_id]
+            controller = self._calls.pop(call_id, None)
+            if controller:
                 logger.info(
                     f"Call unregistered: {call_id}",
-                    extra={"total_calls": len(self._calls)}
+                    extra={
+                        "call_id": call_id,
+                        "total_calls": len(self._calls)
+                    }
                 )
+            return controller
     
     async def get(self, call_id: str) -> Optional[CallController]:
         """Get call controller by ID."""
@@ -66,7 +149,7 @@ class CallRegistry:
             return self._calls.get(call_id)
     
     async def get_all_active(self) -> Dict[str, CallController]:
-        """Get all active calls."""
+        """Get all active calls (copy)."""
         async with self._lock:
             return self._calls.copy()
     
@@ -74,6 +157,80 @@ class CallRegistry:
         """Get count of active calls."""
         async with self._lock:
             return len(self._calls)
+    
+    async def is_at_capacity(self) -> bool:
+        """Check if at maximum capacity."""
+        async with self._lock:
+            return len(self._calls) >= self.max_concurrent_calls
+    
+    async def get_metrics(self) -> Dict[str, Any]:
+        """Get registry metrics."""
+        async with self._lock:
+            return {
+                "active_calls": len(self._calls),
+                "max_concurrent": self.max_concurrent_calls,
+                "total_registered": self._total_registered,
+                "total_rejected": self._total_rejected,
+                "capacity_utilization": len(self._calls) / self.max_concurrent_calls if self.max_concurrent_calls > 0 else 0.0
+            }
+    
+    async def cleanup_all(self) -> None:
+        """
+        Cleanup all registered calls.
+        
+        Used during server shutdown.
+        """
+        logger.warning(
+            "Cleaning up all registered calls",
+            extra={"count": len(self._calls)}
+        )
+        
+        async with self._lock:
+            controllers = list(self._calls.values())
+            call_ids = list(self._calls.keys())
+            self._calls.clear()
+        
+        # Terminate all calls concurrently with timeout
+        cleanup_tasks = []
+        for controller in controllers:
+            cleanup_tasks.append(controller.terminate_call("server_shutdown"))
+        
+        if cleanup_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Some calls did not cleanup within timeout - forcing",
+                    extra={"remaining": len([c for c in controllers if not c._termination_complete])}
+                )
+                
+                # Force terminate remaining calls
+                force_tasks = []
+                for controller in controllers:
+                    if not controller._termination_complete:
+                        force_tasks.append(
+                            controller.terminate_call(
+                                "server_shutdown_forced",
+                                error="shutdown_timeout"
+                            )
+                        )
+                
+                if force_tasks:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*force_tasks, return_exceptions=True),
+                            timeout=5.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error("Force termination also timed out")
+        
+        logger.warning(
+            "All calls cleaned up",
+            extra={"cleaned": len(call_ids)}
+        )
 
 
 class VocodeServer:
@@ -85,6 +242,9 @@ class VocodeServer:
     - WebSocket connections
     - Call lifecycle management
     - CallController creation
+    - Resource limits enforcement
+    - Graceful shutdown
+    - Admission control
     """
     
     def __init__(
@@ -92,9 +252,9 @@ class VocodeServer:
         base_url: str,
         config_manager: BaseConfigManager,
         twilio_config: Optional[TwilioConfig] = None,
-        session_config: Optional[SessionConfig] = None,
         watchdog_limits: Optional[WatchdogLimits] = None,
-        handler_factory: Optional[callable] = None
+        handler_factory: Optional[Callable] = None,
+        max_concurrent_calls: int = 100
     ):
         """
         Initialize server.
@@ -103,30 +263,64 @@ class VocodeServer:
             base_url: Public base URL for webhooks
             config_manager: Vocode config manager
             twilio_config: Twilio configuration
-            session_config: Default session config
             watchdog_limits: Default watchdog limits
             handler_factory: Factory function for creating event handlers
+            max_concurrent_calls: Maximum concurrent calls
         """
         self.base_url = base_url
         self.config_manager = config_manager
         self.twilio_config = twilio_config
-        self.session_config = session_config or SessionConfig()
         self.watchdog_limits = watchdog_limits or WatchdogLimits()
         self.handler_factory = handler_factory
+        self.max_concurrent_calls = max_concurrent_calls
         
-        # Call registry
-        self.registry = CallRegistry()
+        # Call registry with limits
+        self.registry = CallRegistry(max_concurrent_calls=max_concurrent_calls)
+        
+        # Shutdown management
+        self._shutdown_event = asyncio.Event()
+        self._is_shutting_down = False
+        self._shutdown_complete = False
         
         # FastAPI app
-        self.app = FastAPI(title="Vocode Telephony Server")
+        self.app = FastAPI(
+            title="Vocode Telephony Server",
+            lifespan=self._lifespan
+        )
         
         # Setup routes
         self._setup_routes()
         
         logger.info(
             "VocodeServer initialized",
-            extra={"base_url": base_url}
+            extra={
+                "base_url": base_url,
+                "max_concurrent_calls": max_concurrent_calls
+            }
         )
+    
+    @asynccontextmanager
+    async def _lifespan(self, app: FastAPI):
+        """
+        Lifespan context manager for startup/shutdown.
+        
+        Args:
+            app: FastAPI application
+        """
+        # Startup
+        logger.info("Server starting up")
+        yield
+        
+        # Shutdown
+        logger.warning("Server shutting down")
+        self._is_shutting_down = True
+        self._shutdown_event.set()
+        
+        # Cleanup all active calls
+        await self.registry.cleanup_all()
+        
+        self._shutdown_complete = True
+        logger.warning("Server shutdown complete")
     
     def _setup_routes(self) -> None:
         """Setup FastAPI routes."""
@@ -144,6 +338,32 @@ class VocodeServer:
             This is called by Twilio when a call comes in.
             Returns TwiML to connect WebSocket.
             """
+            # Reject if shutting down
+            if self._is_shutting_down:
+                logger.warning(
+                    "Rejecting call - server shutting down",
+                    extra={"call_sid": CallSid}
+                )
+                return PlainTextResponse(
+                    content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>Service temporarily unavailable</Say><Hangup/></Response>',
+                    media_type="application/xml"
+                )
+            
+            # Check capacity
+            if await self.registry.is_at_capacity():
+                logger.error(
+                    "Rejecting call - at capacity",
+                    extra={
+                        "call_sid": CallSid,
+                        "active_calls": await self.registry.count(),
+                        "max": self.max_concurrent_calls
+                    }
+                )
+                return PlainTextResponse(
+                    content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>All agents are busy. Please try again later.</Say><Hangup/></Response>',
+                    media_type="application/xml"
+                )
+            
             return await self._handle_inbound_call(
                 call_sid=CallSid,
                 from_phone=From,
@@ -161,15 +381,41 @@ class VocodeServer:
             
             This receives the audio stream from Twilio.
             """
+            # Reject if shutting down
+            if self._is_shutting_down:
+                logger.warning(
+                    "Rejecting WebSocket - server shutting down",
+                    extra={"call_id": call_id}
+                )
+                await websocket.close(code=1001, reason="Server shutting down")
+                return
+            
             await self._handle_websocket(websocket, call_id)
         
         @self.app.get("/health")
         async def health_check():
             """Health check endpoint."""
             active_calls = await self.registry.count()
+            at_capacity = await self.registry.is_at_capacity()
+            
             return {
-                "status": "healthy",
+                "status": "healthy" if not self._is_shutting_down else "shutting_down",
                 "active_calls": active_calls,
+                "max_calls": self.max_concurrent_calls,
+                "at_capacity": at_capacity,
+                "shutdown_complete": self._shutdown_complete,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        
+        @self.app.get("/metrics")
+        async def metrics():
+            """Metrics endpoint."""
+            registry_metrics = await self.registry.get_metrics()
+            
+            return {
+                **registry_metrics,
+                "is_shutting_down": self._is_shutting_down,
+                "shutdown_complete": self._shutdown_complete,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
         
@@ -204,8 +450,24 @@ class VocodeServer:
             if not controller:
                 raise HTTPException(status_code=404, detail="Call not found")
             
-            await controller.close(reason="manual_hangup")
+            # Don't await - let it happen in background
+            asyncio.create_task(controller.close(reason="manual_hangup"))
             return {"status": "closing"}
+        
+        @self.app.post("/shutdown")
+        async def trigger_shutdown():
+            """Trigger graceful shutdown (admin endpoint)."""
+            if self._is_shutting_down:
+                return {"status": "already_shutting_down"}
+            
+            logger.warning("Shutdown triggered via API")
+            self._is_shutting_down = True
+            self._shutdown_event.set()
+            
+            # Cleanup in background
+            asyncio.create_task(self.registry.cleanup_all())
+            
+            return {"status": "shutdown_initiated"}
     
     async def _handle_inbound_call(
         self,
@@ -235,40 +497,72 @@ class VocodeServer:
             }
         )
         
-        # Create conversation ID
-        call_id = create_conversation_id()
+        try:
+            # Create conversation ID
+            call_id = create_conversation_id()
+            
+            # Extract tenant_id from to_phone or use default
+            tenant_id = self._extract_tenant_id(to_phone)
+            
+            # Create CallController
+            controller = await self._create_call_controller(
+                call_id=call_id,
+                tenant_id=tenant_id,
+                call_sid=call_sid,
+                from_phone=from_phone,
+                to_phone=to_phone
+            )
+            
+            # Register controller (with admission control)
+            registered = await self.registry.register(call_id, controller)
+            
+            if not registered:
+                logger.error(
+                    "Failed to register call - capacity exceeded",
+                    extra={"call_id": call_id}
+                )
+                # Clean up controller since not registered
+                try:
+                    await controller.cleanup()
+                except Exception as e:
+                    logger.error(
+                        f"Error cleaning up unregistered controller: {e}",
+                        extra={"call_id": call_id}
+                    )
+                
+                return PlainTextResponse(
+                    content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>All agents are busy. Please try again later.</Say><Hangup/></Response>',
+                    media_type="application/xml"
+                )
+            
+            # Return TwiML to connect WebSocket
+            twiml = get_connection_twiml(
+                base_url=self.base_url,
+                call_id=call_id
+            )
+            
+            logger.info(
+                "TwiML returned for call",
+                extra={"call_id": call_id, "call_sid": call_sid}
+            )
+            
+            return PlainTextResponse(
+                content=str(twiml),
+                media_type="application/xml"
+            )
         
-        # Extract tenant_id from to_phone or use default
-        # In production, map phone numbers to tenants
-        tenant_id = self._extract_tenant_id(to_phone)
-        
-        # Create CallController
-        controller = await self._create_call_controller(
-            call_id=call_id,
-            tenant_id=tenant_id,
-            call_sid=call_sid,
-            from_phone=from_phone,
-            to_phone=to_phone
-        )
-        
-        # Register controller
-        await self.registry.register(call_id, controller)
-        
-        # Return TwiML to connect WebSocket
-        twiml = get_connection_twiml(
-            base_url=self.base_url,
-            call_id=call_id
-        )
-        
-        logger.info(
-            "TwiML returned for call",
-            extra={"call_id": call_id, "call_sid": call_sid}
-        )
-        
-        return PlainTextResponse(
-            content=str(twiml),
-            media_type="application/xml"
-        )
+        except Exception as e:
+            logger.error(
+                f"Error handling inbound call: {e}",
+                extra={"call_sid": call_sid},
+                exc_info=True
+            )
+            
+            # Return error TwiML
+            return PlainTextResponse(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>An error occurred. Please try again later.</Say><Hangup/></Response>',
+                media_type="application/xml"
+            )
     
     async def _handle_websocket(
         self,
@@ -287,46 +581,77 @@ class VocodeServer:
             extra={"call_id": call_id}
         )
         
-        # Accept WebSocket
-        await websocket.accept()
-        
-        # Get controller
-        controller = await self.registry.get(call_id)
-        if not controller:
-            logger.error(
-                "No controller found for WebSocket",
-                extra={"call_id": call_id}
-            )
-            await websocket.close(code=1008, reason="No controller")
-            return
+        controller = None
         
         try:
-            # This will be implemented in vocode_session.py
-            # which creates the actual Vocode StreamingConversation
-            # and bridges it to the controller
+            # Accept WebSocket
+            await websocket.accept()
             
-            # For now, placeholder
+            # Get controller
+            controller = await self.registry.get(call_id)
+            if not controller:
+                logger.error(
+                    "No controller found for WebSocket",
+                    extra={"call_id": call_id}
+                )
+                await websocket.close(code=1008, reason="No controller")
+                return
+            
+            # Start controller session
+            try:
+                await controller.start()
+            except Exception as e:
+                logger.error(
+                    f"Error starting controller: {e}",
+                    extra={"call_id": call_id},
+                    exc_info=True
+                )
+                await websocket.close(code=1011, reason="Controller start failed")
+                return
+            
+            # This will be fully implemented when integrating VocodeSession
+            # For now, keep connection alive and handle basic lifecycle
+            
             logger.info(
-                "WebSocket connected, awaiting session implementation",
+                "WebSocket connected and controller started",
                 extra={"call_id": call_id}
             )
             
-            # Keep connection alive
-            while True:
+            # Keep connection alive until termination
+            while not controller._termination_complete and not self._is_shutting_down:
                 try:
-                    message = await websocket.receive_json()
-                    # Process message (will be handled by vocode_session)
+                    # Wait for message with timeout
+                    message = await asyncio.wait_for(
+                        websocket.receive_json(),
+                        timeout=1.0
+                    )
+                    
+                    # Process message (will be handled by VocodeSession)
                     logger.debug(
                         "WebSocket message received",
                         extra={"call_id": call_id}
                     )
+                
+                except asyncio.TimeoutError:
+                    # Normal timeout, check if should continue
+                    continue
+                
                 except Exception as e:
                     logger.error(
-                        f"WebSocket error: {e}",
+                        f"WebSocket receive error: {e}",
                         extra={"call_id": call_id},
                         exc_info=True
                     )
                     break
+            
+            logger.info(
+                "WebSocket loop ended",
+                extra={
+                    "call_id": call_id,
+                    "termination_complete": controller._termination_complete,
+                    "shutting_down": self._is_shutting_down
+                }
+            )
         
         except Exception as e:
             logger.error(
@@ -338,16 +663,70 @@ class VocodeServer:
         finally:
             # Cleanup
             logger.info(
-                "WebSocket disconnected",
+                "WebSocket disconnected - cleaning up",
                 extra={"call_id": call_id}
             )
             
-            # Close call
+            # Close call if not already terminated
+            if controller and not controller._termination_complete:
+                try:
+                    await asyncio.wait_for(
+                        controller.close(reason="websocket_closed"),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Controller close timed out - forcing termination",
+                        extra={"call_id": call_id}
+                    )
+                    # Force termination
+                    try:
+                        await asyncio.wait_for(
+                            controller.terminate_call(
+                                "websocket_close_timeout",
+                                error="close_timeout"
+                            ),
+                            timeout=3.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "Forced termination also timed out",
+                            extra={"call_id": call_id}
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Error closing controller: {e}",
+                        extra={"call_id": call_id},
+                        exc_info=True
+                    )
+            
+            # Cleanup controller
             if controller:
-                await controller.close(reason="websocket_closed")
+                try:
+                    await asyncio.wait_for(
+                        controller.cleanup(),
+                        timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Controller cleanup timed out",
+                        extra={"call_id": call_id}
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error cleaning up controller: {e}",
+                        extra={"call_id": call_id},
+                        exc_info=True
+                    )
             
             # Unregister
             await self.registry.unregister(call_id)
+            
+            # Close WebSocket if not already closed
+            try:
+                await websocket.close()
+            except Exception:
+                pass
     
     async def _create_call_controller(
         self,
@@ -373,34 +752,28 @@ class VocodeServer:
         # Create event handlers
         handlers = {}
         if self.handler_factory:
-            handlers = self.handler_factory(
-                call_id=call_id,
-                tenant_id=tenant_id
-            )
-        
-        # Create session config
-        session_config = SessionConfig(
-            max_call_duration=self.session_config.max_call_duration,
-            max_silence_duration=self.session_config.max_silence_duration,
-            max_ai_response_time=self.session_config.max_ai_response_time,
-            enable_barge_in=self.session_config.enable_barge_in,
-            enable_language_detection=self.session_config.enable_language_detection,
-            enable_transfer=self.session_config.enable_transfer
-        )
+            try:
+                handlers = self.handler_factory(
+                    call_id=call_id,
+                    tenant_id=tenant_id,
+                    call_sid=call_sid,
+                    from_phone=from_phone,
+                    to_phone=to_phone
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error creating handlers: {e}",
+                    extra={"call_id": call_id},
+                    exc_info=True
+                )
         
         # Create controller
         controller = CallController(
             call_id=call_id,
             tenant_id=tenant_id,
-            session_config=session_config,
             watchdog_limits=self.watchdog_limits,
             handlers=handlers
         )
-        
-        # Set metadata
-        controller.session.metadata.twilio_call_sid = call_sid
-        controller.session.metadata.from_number = from_phone
-        controller.session.metadata.to_number = to_phone
         
         logger.info(
             "CallController created",
@@ -447,7 +820,10 @@ class VocodeServer:
         """
         logger.info(
             f"Starting VocodeServer on {host}:{port}",
-            extra={"base_url": self.base_url}
+            extra={
+                "base_url": self.base_url,
+                "max_concurrent_calls": self.max_concurrent_calls
+            }
         )
         
         uvicorn.run(
