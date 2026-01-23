@@ -5,6 +5,7 @@ Production-grade OpenAI client with streaming, timeouts, and cancellation.
 
 Responsibilities:
 - Manage OpenAI API calls
+- Support dual-model strategy (primary: gpt-4o, fast: gpt-3.5-turbo)
 - Support streaming responses
 - Handle cancellation tokens
 - Enforce hard timeouts
@@ -28,6 +29,7 @@ import logging
 from typing import Optional, Dict, Any, List, AsyncGenerator
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from enum import Enum
 import os
 
 from openai import AsyncOpenAI, AsyncStream
@@ -37,20 +39,38 @@ from openai import APIError, APITimeoutError, RateLimitError, APIConnectionError
 logger = logging.getLogger(__name__)
 
 
+class ModelTier(Enum):
+    """Model tier selection."""
+    PRIMARY = "primary"  # gpt-4o - for reasoning and complex tasks
+    FAST = "fast"  # gpt-3.5-turbo - for simple, fast responses
+
+
 @dataclass
 class LLMConfig:
     """Configuration for LLM client."""
     api_key: Optional[str] = None
-    model: str = "gpt-4o-mini"
+    
+    # Dual model setup
+    primary_model: str = "gpt-4o"
+    fast_model: str = "gpt-3.5-turbo"
+    
+    # Token limits
     max_tokens: int = 1024
+    max_prompt_tokens: int = 4000
+    max_completion_tokens: int = 2000
+    
+    # Model parameters
     temperature: float = 0.7
-    timeout: float = 15.0  # Increased for reliability
+    
+    # Timeouts
+    primary_timeout: float = 15.0
+    fast_timeout: float = 5.0
+    
+    # Streaming
     streaming: bool = True
     max_retries: int = 2
     
     # Safety limits
-    max_prompt_tokens: int = 4000
-    max_completion_tokens: int = 2000
     max_input_length: int = 16000  # Character limit for safety
     
     # Circuit breaker
@@ -68,8 +88,11 @@ class LLMConfig:
         if not self.api_key:
             raise ValueError("OpenAI API key is required")
         
-        if self.timeout <= 0:
-            raise ValueError("Timeout must be positive")
+        if self.primary_timeout <= 0:
+            raise ValueError("Primary timeout must be positive")
+        
+        if self.fast_timeout <= 0:
+            raise ValueError("Fast timeout must be positive")
         
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
@@ -79,6 +102,24 @@ class LLMConfig:
                 f"max_tokens ({self.max_tokens}) exceeds max_completion_tokens ({self.max_completion_tokens}), capping"
             )
             self.max_tokens = self.max_completion_tokens
+    
+    def get_model(self, tier: ModelTier) -> str:
+        """Get model name for tier."""
+        if tier == ModelTier.PRIMARY:
+            return self.primary_model
+        elif tier == ModelTier.FAST:
+            return self.fast_model
+        else:
+            return self.primary_model
+    
+    def get_timeout(self, tier: ModelTier) -> float:
+        """Get timeout for tier."""
+        if tier == ModelTier.PRIMARY:
+            return self.primary_timeout
+        elif tier == ModelTier.FAST:
+            return self.fast_timeout
+        else:
+            return self.primary_timeout
 
 
 class LLMResponse:
@@ -88,6 +129,7 @@ class LLMResponse:
         self,
         text: str,
         model: str,
+        tier: ModelTier,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
@@ -97,6 +139,7 @@ class LLMResponse:
     ):
         self.text = text
         self.model = model
+        self.tier = tier
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.total_tokens = total_tokens
@@ -109,6 +152,7 @@ class LLMResponse:
         return {
             "text": self.text,
             "model": self.model,
+            "tier": self.tier.value,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
@@ -260,18 +304,26 @@ class RateLimiter:
                 if req.timestamp() > cutoff
             ]
             
-            # Check if at limit
+            # Check if we're at limit
             if len(self._requests) >= self.max_requests:
                 # Calculate wait time
-                oldest = self._requests[0]
-                wait_time = self.window_size - (now.timestamp() - oldest.timestamp())
+                oldest_request = self._requests[0]
+                wait_time = self.window_size - (
+                    now.timestamp() - oldest_request.timestamp()
+                )
                 
                 if wait_time > 0:
                     logger.warning(
                         f"Rate limit reached, waiting {wait_time:.2f}s",
-                        extra={"requests_in_window": len(self._requests)}
+                        extra={"current": len(self._requests)}
                     )
-                    await asyncio.sleep(wait_time)
+                    
+                    # Release lock while waiting
+                    self._lock.release()
+                    try:
+                        await asyncio.sleep(wait_time)
+                    finally:
+                        await self._lock.acquire()
                     
                     # Clean up again after wait
                     now = datetime.now(timezone.utc)
@@ -287,9 +339,10 @@ class RateLimiter:
 
 class LLMClient:
     """
-    Production OpenAI client with async support.
+    Production OpenAI client with async support and dual-model strategy.
     
     Features:
+    - Dual model support (primary: gpt-4o, fast: gpt-3.5-turbo)
     - Hard timeouts on all calls
     - Cancellation support
     - Circuit breaker protection
@@ -311,7 +364,7 @@ class LLMClient:
         
         self.client = AsyncOpenAI(
             api_key=self.config.api_key,
-            timeout=self.config.timeout,
+            timeout=self.config.primary_timeout,
             max_retries=self.config.max_retries
         )
         
@@ -338,9 +391,10 @@ class LLMClient:
         logger.info(
             "LLM client initialized",
             extra={
-                "model": self.config.model,
-                "timeout": self.config.timeout,
-                "max_tokens": self.config.max_tokens
+                "primary_model": self.config.primary_model,
+                "fast_model": self.config.fast_model,
+                "primary_timeout": self.config.primary_timeout,
+                "fast_timeout": self.config.fast_timeout
             }
         )
     
@@ -392,111 +446,96 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
         call_id: Optional[str] = None,
-        cancellation_token: Optional[asyncio.Event] = None
+        cancellation_token: Optional[asyncio.Event] = None,
+        tier: ModelTier = ModelTier.PRIMARY
     ) -> LLMResponse:
         """
         Execute LLM completion with safety controls.
         
         Args:
-            messages: Chat messages
-            system_prompt: Optional system prompt
-            temperature: Sampling temperature
-            max_tokens: Maximum completion tokens
-            timeout: Request timeout in seconds
-            call_id: Call identifier for logging
-            cancellation_token: Event to signal cancellation
+            messages: Conversation messages
+            system_prompt: Optional system prompt (prepended if provided)
+            temperature: Sampling temperature (uses config default if None)
+            max_tokens: Max completion tokens (uses config default if None)
+            timeout: Request timeout (uses tier default if None)
+            call_id: Call ID for logging
+            cancellation_token: Event to cancel request
+            tier: Model tier to use (PRIMARY or FAST)
             
         Returns:
             LLM response
             
         Raises:
-            asyncio.TimeoutError: On timeout
-            asyncio.CancelledError: On cancellation
-            ValueError: On invalid input
-            Exception: On API errors
+            ValueError: If input is invalid
+            asyncio.TimeoutError: If request times out
+            APIError: If OpenAI API fails
         """
         start_time = datetime.now(timezone.utc)
         
         # Check circuit breaker
         if not await self.circuit_breaker.can_attempt():
-            async with self._metrics_lock:
-                self._total_errors += 1
-            raise Exception("Circuit breaker open - LLM calls blocked")
+            raise RuntimeError("Circuit breaker is open")
         
-        # Build messages
-        if system_prompt:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                *messages
-            ]
+        # Rate limit
+        await self.rate_limiter.acquire()
         
-        # Validate messages
+        # Validate input
         self._validate_messages(messages, call_id)
         
-        # Use configured defaults
-        actual_temperature = (
-            temperature if temperature is not None
-            else self.config.temperature
-        )
-        actual_max_tokens = (
-            max_tokens if max_tokens is not None
-            else self.config.max_tokens
-        )
-        actual_timeout = (
-            timeout if timeout is not None
-            else self.config.timeout
-        )
+        # Build final messages
+        final_messages = []
+        if system_prompt:
+            final_messages.append({
+                "role": "system",
+                "content": system_prompt
+            })
+        final_messages.extend(messages)
         
-        # Enforce token limits
+        # Get model and timeout for tier
+        model = self.config.get_model(tier)
+        actual_timeout = timeout or self.config.get_timeout(tier)
+        actual_temperature = temperature if temperature is not None else self.config.temperature
+        actual_max_tokens = max_tokens or self.config.max_tokens
+        
+        # Cap max_tokens
         if actual_max_tokens > self.config.max_completion_tokens:
-            logger.warning(
-                f"Requested {actual_max_tokens} tokens, limiting to {self.config.max_completion_tokens}",
-                extra={"call_id": call_id}
-            )
             actual_max_tokens = self.config.max_completion_tokens
         
-        # Clamp temperature
-        actual_temperature = max(0.0, min(2.0, actual_temperature))
-        
-        logger.debug(
-            "Starting LLM completion",
+        logger.info(
+            f"LLM completion request ({tier.value})",
             extra={
                 "call_id": call_id,
-                "model": self.config.model,
+                "model": model,
+                "timeout": actual_timeout,
                 "max_tokens": actual_max_tokens,
-                "timeout": actual_timeout
+                "message_count": len(final_messages)
             }
         )
         
         try:
-            # Rate limiting
-            await self.rate_limiter.acquire()
-            
             # Create completion task
             completion_task = asyncio.create_task(
                 self.client.chat.completions.create(
-                    model=self.config.model,
-                    messages=messages,
+                    model=model,
+                    messages=final_messages,
                     temperature=actual_temperature,
                     max_tokens=actual_max_tokens,
                     stream=False
                 )
             )
             
-            # Wait with timeout and cancellation support
+            # Handle cancellation
             if cancellation_token:
                 # Wait for either completion or cancellation
                 done, pending = await asyncio.wait(
-                    [
-                        completion_task,
-                        asyncio.create_task(cancellation_token.wait())
-                    ],
+                    [completion_task],
                     timeout=actual_timeout,
                     return_when=asyncio.FIRST_COMPLETED
                 )
                 
                 # Check if cancelled
                 if cancellation_token.is_set():
+                    # Cancel the task
                     completion_task.cancel()
                     try:
                         await completion_task
@@ -510,10 +549,11 @@ class LLMClient:
                         "LLM completion cancelled",
                         extra={"call_id": call_id}
                     )
-                    raise asyncio.CancelledError("LLM call cancelled")
+                    raise asyncio.CancelledError("Completion cancelled by token")
                 
                 # Check if timed out
-                if completion_task not in done:
+                if not done:
+                    # Timeout
                     completion_task.cancel()
                     try:
                         await completion_task
@@ -526,7 +566,7 @@ class LLMClient:
                     await self.circuit_breaker.record_failure()
                     
                     logger.error(
-                        f"LLM timeout after {actual_timeout}s",
+                        f"LLM timeout after {actual_timeout}s ({tier.value})",
                         extra={"call_id": call_id}
                     )
                     raise asyncio.TimeoutError(f"LLM timeout after {actual_timeout}s")
@@ -561,7 +601,7 @@ class LLMClient:
                 
                 # Estimate cost
                 cost = self._estimate_cost(
-                    self.config.model,
+                    model,
                     prompt_tokens,
                     completion_tokens
                 )
@@ -571,9 +611,10 @@ class LLMClient:
             await self.circuit_breaker.record_success()
             
             logger.info(
-                "LLM completion success",
+                f"LLM completion success ({tier.value})",
                 extra={
                     "call_id": call_id,
+                    "model": model,
                     "tokens": total_tokens,
                     "latency_ms": latency_ms,
                     "finish_reason": finish_reason,
@@ -583,7 +624,8 @@ class LLMClient:
             
             return LLMResponse(
                 text=text,
-                model=self.config.model,
+                model=model,
+                tier=tier,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
@@ -607,7 +649,7 @@ class LLMClient:
                 self._total_errors += 1
             await self.circuit_breaker.record_failure()
             logger.error(
-                f"LLM timeout after {actual_timeout}s",
+                f"LLM timeout after {actual_timeout}s ({tier.value})",
                 extra={"call_id": call_id}
             )
             raise
@@ -653,6 +695,52 @@ class LLMClient:
                 exc_info=True
             )
             raise
+    
+    async def complete_fast(
+        self,
+        messages: List[Dict[str, str]],
+        **kwargs
+    ) -> LLMResponse:
+        """
+        Fast completion using gpt-3.5-turbo.
+        
+        Convenience method for quick responses.
+        
+        Args:
+            messages: Conversation messages
+            **kwargs: Additional arguments for complete()
+            
+        Returns:
+            LLM response
+        """
+        return await self.complete(
+            messages=messages,
+            tier=ModelTier.FAST,
+            **kwargs
+        )
+    
+    async def complete_primary(
+        self,
+        messages: List[Dict[str, str]],
+        **kwargs
+    ) -> LLMResponse:
+        """
+        Primary completion using gpt-4o.
+        
+        Convenience method for reasoning tasks.
+        
+        Args:
+            messages: Conversation messages
+            **kwargs: Additional arguments for complete()
+            
+        Returns:
+            LLM response
+        """
+        return await self.complete(
+            messages=messages,
+            tier=ModelTier.PRIMARY,
+            **kwargs
+        )
     
     def _estimate_cost(
         self,
