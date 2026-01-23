@@ -59,6 +59,29 @@ CRITICAL RULES:
 - If a customer asks for something not on the menu, politely decline
 """
     
+    # Multilingual instruction template
+    MULTILINGUAL_INSTRUCTION = """
+LANGUAGE REQUIREMENTS:
+- The customer is speaking: {language_name} ({language_code})
+- You MUST respond to the customer ONLY in {language_name}
+- Your assistant_text field MUST be in {language_name}
+- ALL structured output (actions, item_ids, categories, etc.) MUST use English keys and canonical identifiers
+- NEVER translate menu item IDs, category names, or action types
+- Your conversational responses to the customer must be natural {language_name}
+
+Example correct output structure:
+{{
+  "assistant_text": "<your response in {language_name}>",
+  "actions": [
+    {{
+      "type": "add_item",
+      "item_id": "burger_classic",
+      "quantity": 1
+    }}
+  ]
+}}
+"""
+    
     # Menu context template
     MENU_CONTEXT = """
 CURRENT MENU:
@@ -98,6 +121,30 @@ RECENT CONVERSATION:
 SPECIAL INSTRUCTIONS:
 {instructions}
 """
+
+
+# Language name mapping for clear instructions
+LANGUAGE_NAMES = {
+    "en": "English",
+    "es": "Spanish",
+    "ar": "Arabic",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "hi": "Hindi",
+    "tr": "Turkish",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "sv": "Swedish",
+    "da": "Danish",
+    "no": "Norwegian",
+    "fi": "Finnish",
+}
 
 
 class PromptSanitizer:
@@ -205,7 +252,7 @@ class PromptSanitizer:
         
         # Remove potential injection sequences
         text = text.replace('[system]', '').replace('[assistant]', '')
-        text = text.replace('<system>', '').replace('<assistant>', '')
+        text = text.replace('<s>', '').replace('<assistant>', '')
         
         return text.strip()
     
@@ -246,6 +293,7 @@ class PromptBuilder:
     - Conversation history
     - Upsell suggestions
     - Special instructions
+    - Multilingual directives
     
     SECURITY:
     - All inputs are sanitized
@@ -290,7 +338,8 @@ class PromptBuilder:
         menu_data: Optional[Dict[str, Any]] = None,
         order_data: Optional[Dict[str, Any]] = None,
         upsell_suggestions: Optional[List[str]] = None,
-        special_instructions: Optional[str] = None
+        special_instructions: Optional[str] = None,
+        detected_language: Optional[str] = None
     ) -> str:
         """
         Build complete system prompt with all context.
@@ -300,11 +349,18 @@ class PromptBuilder:
             order_data: Current order data
             upsell_suggestions: Upsell suggestion strings
             special_instructions: Special instructions
+            detected_language: Detected language code (e.g., 'es', 'ar')
             
         Returns:
             Complete system prompt
         """
         sections = [self.base_system_prompt]
+        
+        # Add multilingual instruction if language detected
+        if detected_language:
+            language_section = self._build_language_section(detected_language)
+            if language_section:
+                sections.append(language_section)
         
         # Add menu context (validated)
         if menu_data:
@@ -346,7 +402,8 @@ class PromptBuilder:
         menu_data: Optional[Dict[str, Any]] = None,
         order_data: Optional[Dict[str, Any]] = None,
         upsell_suggestions: Optional[List[str]] = None,
-        special_instructions: Optional[str] = None
+        special_instructions: Optional[str] = None,
+        detected_language: Optional[str] = None
     ) -> List[Dict[str, str]]:
         """
         Build complete message list for LLM.
@@ -358,6 +415,7 @@ class PromptBuilder:
             order_data: Order data
             upsell_suggestions: Upsell suggestions
             special_instructions: Special instructions
+            detected_language: Detected language code (e.g., 'es', 'ar')
             
         Returns:
             List of messages for LLM
@@ -369,7 +427,8 @@ class PromptBuilder:
             menu_data=menu_data,
             order_data=order_data,
             upsell_suggestions=upsell_suggestions,
-            special_instructions=special_instructions
+            special_instructions=special_instructions,
+            detected_language=detected_language
         )
         messages.append({
             "role": "system",
@@ -391,6 +450,28 @@ class PromptBuilder:
         })
         
         return messages
+    
+    def _build_language_section(self, language_code: str) -> str:
+        """
+        Build language instruction section.
+        
+        Args:
+            language_code: Language code (e.g., 'es', 'ar', 'en')
+            
+        Returns:
+            Formatted language instruction section
+        """
+        if not language_code:
+            return ""
+        
+        # Get language name
+        language_name = LANGUAGE_NAMES.get(language_code, language_code.upper())
+        
+        # Format instruction
+        return PromptTemplate.MULTILINGUAL_INSTRUCTION.format(
+            language_code=language_code,
+            language_name=language_name
+        )
     
     def _sanitize_input(self, text: str) -> str:
         """
