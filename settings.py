@@ -8,8 +8,8 @@ typed access to settings.
 """
 
 import os
-from typing import Optional, Dict
-from dataclasses import dataclass
+from typing import Optional, Dict, List
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -68,15 +68,17 @@ class SpeechSettings:
     elevenlabs_voice_map: str = os.getenv("ELEVENLABS_VOICE_MAP", "{}")
 
 
+def _get_supported_languages() -> List[str]:
+    """Helper function to get supported languages list."""
+    return os.getenv("SUPPORTED_LANGUAGES", "en,es,ar").split(",")
+
+
 @dataclass
 class LanguageSettings:
     """Language detection and translation settings."""
     
     default_language: str = os.getenv("DEFAULT_LANGUAGE", "en")
-    supported_languages: list = os.getenv(
-        "SUPPORTED_LANGUAGES",
-        "en,es,ar"
-    ).split(",")
+    supported_languages: List[str] = field(default_factory=_get_supported_languages)
     min_confidence: float = float(os.getenv("MIN_LANGUAGE_CONFIDENCE", "0.7"))
     translation_timeout: float = float(os.getenv("TRANSLATION_TIMEOUT", "2.0"))
 
@@ -149,13 +151,13 @@ class Settings:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     
     # Sub-settings
-    vocode: VocodeSettings = VocodeSettings()
-    ai: AISettings = AISettings()
-    speech: SpeechSettings = SpeechSettings()
-    language: LanguageSettings = LanguageSettings()
-    database: DatabaseSettings = DatabaseSettings()
-    session: SessionSettings = SessionSettings()
-    features: FeatureFlags = FeatureFlags()
+    vocode: VocodeSettings = field(default_factory=VocodeSettings)
+    ai: AISettings = field(default_factory=AISettings)
+    speech: SpeechSettings = field(default_factory=SpeechSettings)
+    language: LanguageSettings = field(default_factory=LanguageSettings)
+    database: DatabaseSettings = field(default_factory=DatabaseSettings)
+    session: SessionSettings = field(default_factory=SessionSettings)
+    features: FeatureFlags = field(default_factory=FeatureFlags)
     
     def __post_init__(self):
         """Initialize sub-settings."""
