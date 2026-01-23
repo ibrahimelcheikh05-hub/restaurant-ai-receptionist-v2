@@ -14,9 +14,9 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config.settings import get_settings
-from platform.observability import setup_logging, get_events, get_health
-from vocode_bridge.vocode_server import VocodeServer
+from settings import get_settings
+from observability import setup_logging, get_events, get_health
+from vocode_server import VocodeServer
 from vocode.streaming.telephony.config_manager.in_memory_config_manager import (
     InMemoryConfigManager
 )
@@ -32,7 +32,7 @@ async def initialize_system() -> None:
     
     try:
         # Initialize database
-        from integrations.db import get_default_db
+        from db import get_default_db
         db = get_default_db()
         await db.initialize()
         health.mark_healthy("database")
@@ -45,11 +45,11 @@ async def initialize_system() -> None:
     
     try:
         # Initialize other components
-        from ai.llm_client import get_default_client
-        from language.detector import get_default_detector
-        from language.translator import get_default_translator
-        from business.menu_engine import get_default_engine as get_menu_engine
-        from business.order_engine import get_default_engine as get_order_engine
+        from llm_client import get_default_client
+        from detector import get_default_detector
+        from translator import get_default_translator
+        from menu_engine import get_default_engine as get_menu_engine
+        from order_engine import get_default_engine as get_order_engine
         
         # Just instantiate to initialize
         get_default_client()
@@ -83,18 +83,18 @@ def create_event_handlers(call_id: str, tenant_id: str) -> dict:
     Returns:
         Dict of handler functions
     """
-    from business.menu_engine import get_default_engine as get_menu_engine
-    from business.order_engine import get_default_engine as get_order_engine
-    from business.upsell_engine import get_default_engine as get_upsell_engine
-    from ai.llm_client import get_default_client as get_llm_client
-    from ai.prompt_builder import get_default_builder as get_prompt_builder
-    from ai.output_parser import get_default_parser as get_output_parser
-    from ai.safety import get_default_filter as get_safety_filter
-    from language.detector import get_default_detector
-    from language.translator import get_default_translator
-    from memory.conversation_memory import create_memory, get_memory
-    from integrations.sms import send_order_confirmation
-    from platform.tenant_config import get_tenant_config
+    from menu_engine import get_default_engine as get_menu_engine
+    from order_engine import get_default_engine as get_order_engine
+    from upsell_engine import get_default_engine as get_upsell_engine
+    from llm_client import get_default_client as get_llm_client
+    from prompt_builder import get_default_builder as get_prompt_builder
+    from output_parser import get_default_parser as get_output_parser
+    from safety import get_default_filter as get_safety_filter
+    from detector import get_default_detector
+    from translator import get_default_translator
+    from conversation_memory import create_memory, get_memory
+    from sms import send_order_confirmation
+    from tenant_config import get_tenant_config
     
     # Get engines
     menu_engine = get_menu_engine()
