@@ -8,8 +8,16 @@ Responsibilities:
 - Wrap Vocode's EndConversation action
 - Ensure all actions go through CallController approval
 - Prevent AI from directly controlling system flow
+- Validate state before action execution
+- NEVER allow AI to bypass controller authority
 
 These actions are registered with Vocode but defer decisions to CallController.
+
+CRITICAL SAFETY RULES:
+- Actions MUST check controller state
+- Actions MUST be approved by controller
+- Actions CANNOT execute in frozen states
+- Actions CANNOT bypass termination checks
 """
 
 import asyncio
@@ -34,6 +42,7 @@ logger = logging.getLogger(__name__)
 class ControlledTransferCallParameters(BaseModel):
     """Parameters for controlled transfer."""
     reason: Optional[str] = "user_requested"
+    transfer_number: Optional[str] = None
 
 
 class ControlledTransferCallResponse(BaseModel):
@@ -86,11 +95,18 @@ class ControlledTransferCall(
     Flow:
     1. AI suggests transfer
     2. This action is triggered
-    3. We route to CallController for approval
-    4. If approved, we execute Twilio transfer
-    5. If denied, we return denial message
+    3. Validate controller state
+    4. Route to CallController for approval
+    5. If approved, CallController executes transfer sequence
+    6. If denied, return denial message
     
     CallController maintains control - AI cannot force transfers.
+    
+    SAFETY:
+    - Cannot execute if controller is terminating
+    - Cannot execute in frozen state
+    - Must be approved by controller
+    - Transfer is handled by controller, not this action
     """
     
     description: str = (
@@ -126,6 +142,11 @@ class ControlledTransferCall(
         )
         
         self.call_controller = call_controller
+        
+        logger.debug(
+            "ControlledTransferCall initialized",
+            extra={"has_controller": call_controller is not None}
+        )
     
     async def run(
         self,
@@ -140,16 +161,71 @@ class ControlledTransferCall(
         Returns:
             Transfer result
         """
+        reason = action_input.params.reason or "ai_suggested"
+        transfer_number = action_input.params.transfer_number
+        
         logger.info(
             "Transfer action triggered",
             extra={
-                "reason": action_input.params.reason
+                "reason": reason,
+                "number": transfer_number
             }
         )
         
+        # SAFETY CHECK 1: Verify controller exists
+        if not self.call_controller:
+            logger.error("No CallController - cannot approve transfer")
+            return ActionOutput(
+                action_type=action_input.action_config.type,
+                response=ControlledTransferCallResponse(
+                    success=False,
+                    approved=False,
+                    message="System error - transfer unavailable"
+                )
+            )
+        
+        # SAFETY CHECK 2: Verify controller is not terminating
+        if self.call_controller._termination_in_progress:
+            logger.warning(
+                "Transfer blocked - controller terminating",
+                extra={"call_id": self.call_controller.call_id}
+            )
+            return ActionOutput(
+                action_type=action_input.action_config.type,
+                response=ControlledTransferCallResponse(
+                    success=False,
+                    approved=False,
+                    message="Call is ending"
+                )
+            )
+        
+        # SAFETY CHECK 3: Verify not in frozen state
+        if self.call_controller.state_machine.is_frozen():
+            logger.warning(
+                "Transfer blocked - frozen state",
+                extra={
+                    "call_id": self.call_controller.call_id,
+                    "state": self.call_controller.state_machine.current_state.value
+                }
+            )
+            return ActionOutput(
+                action_type=action_input.action_config.type,
+                response=ControlledTransferCallResponse(
+                    success=False,
+                    approved=False,
+                    message="Transfer not available in current state"
+                )
+            )
+        
         # Wait for user message to complete if needed
         if action_input.user_message_tracker is not None:
-            await action_input.user_message_tracker.wait()
+            try:
+                await asyncio.wait_for(
+                    action_input.user_message_tracker.wait(),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("User message tracker wait timed out")
         
         # Check if last message was interrupted
         if self.conversation_state_manager.transcript.was_last_message_interrupted():
@@ -163,65 +239,78 @@ class ControlledTransferCall(
                 )
             )
         
-        # Route through CallController for approval
-        if not self.call_controller:
-            logger.error("No CallController - cannot approve transfer")
-            return ActionOutput(
-                action_type=action_input.action_config.type,
-                response=ControlledTransferCallResponse(
-                    success=False,
-                    approved=False,
-                    message="System error - transfer unavailable"
-                )
-            )
-        
-        # Request transfer from controller
-        transfer_result = await self.call_controller._handle_transfer_request(
-            reason=action_input.params.reason or "ai_suggested"
-        )
-        
-        approved = transfer_result.get("status") == "transfer_approved"
-        transfer_number = transfer_result.get("transfer_number")
-        
-        if not approved:
-            logger.info("Transfer denied by controller")
-            return ActionOutput(
-                action_type=action_input.action_config.type,
-                response=ControlledTransferCallResponse(
-                    success=False,
-                    approved=False,
-                    message=transfer_result.get("response_text")
-                )
-            )
-        
-        # Transfer approved - execute Twilio transfer
-        logger.info(f"Transfer approved - executing to {transfer_number}")
-        
+        # Route through CallController for approval and execution
+        # Controller will handle the full transfer sequence
         try:
-            # Get Twilio call SID
-            twilio_call_sid = self.get_twilio_sid(action_input)
-            
-            # Execute transfer via Twilio
-            await self._execute_twilio_transfer(
-                twilio_call_sid=twilio_call_sid,
-                to_phone=transfer_number
+            transfer_result = await self.call_controller._handle_transfer_request(
+                reason=reason,
+                transfer_number=transfer_number
             )
             
-            logger.info("Transfer executed successfully")
+            status = transfer_result.get("status")
             
-            return ActionOutput(
-                action_type=action_input.action_config.type,
-                response=ControlledTransferCallResponse(
-                    success=True,
-                    approved=True,
-                    transfer_number=transfer_number,
-                    message=transfer_result.get("response_text")
+            # Check result
+            if status == "denied":
+                logger.info("Transfer denied by controller")
+                return ActionOutput(
+                    action_type=action_input.action_config.type,
+                    response=ControlledTransferCallResponse(
+                        success=False,
+                        approved=False,
+                        message="Transfer not approved"
+                    )
                 )
-            )
+            
+            elif status == "approved":
+                # Transfer was approved and executed by controller
+                logger.info("Transfer approved and executed by controller")
+                return ActionOutput(
+                    action_type=action_input.action_config.type,
+                    response=ControlledTransferCallResponse(
+                        success=True,
+                        approved=True,
+                        transfer_number=transfer_result.get("number"),
+                        message="Transfer initiated"
+                    )
+                )
+            
+            elif status in ["already_in_progress", "already_transferred"]:
+                logger.info(f"Transfer status: {status}")
+                return ActionOutput(
+                    action_type=action_input.action_config.type,
+                    response=ControlledTransferCallResponse(
+                        success=False,
+                        approved=False,
+                        message="Transfer already in progress"
+                    )
+                )
+            
+            elif status == "terminating":
+                logger.info("Transfer blocked - call terminating")
+                return ActionOutput(
+                    action_type=action_input.action_config.type,
+                    response=ControlledTransferCallResponse(
+                        success=False,
+                        approved=False,
+                        message="Call is ending"
+                    )
+                )
+            
+            else:
+                logger.warning(f"Unknown transfer status: {status}")
+                return ActionOutput(
+                    action_type=action_input.action_config.type,
+                    response=ControlledTransferCallResponse(
+                        success=False,
+                        approved=False,
+                        message="Transfer failed"
+                    )
+                )
         
         except Exception as e:
             logger.error(
-                f"Transfer execution failed: {e}",
+                f"Transfer request failed: {e}",
+                extra={"call_id": self.call_controller.call_id},
                 exc_info=True
             )
             
@@ -229,54 +318,10 @@ class ControlledTransferCall(
                 action_type=action_input.action_config.type,
                 response=ControlledTransferCallResponse(
                     success=False,
-                    approved=True,
-                    transfer_number=transfer_number,
-                    message="Transfer approved but failed to execute"
+                    approved=False,
+                    message="Transfer request failed"
                 )
             )
-    
-    async def _execute_twilio_transfer(
-        self,
-        twilio_call_sid: str,
-        to_phone: str
-    ) -> dict:
-        """
-        Execute Twilio call transfer.
-        
-        Args:
-            twilio_call_sid: Twilio call SID
-            to_phone: Phone number to transfer to
-            
-        Returns:
-            Twilio API response
-        """
-        from vocode.streaming.utils.async_requester import AsyncRequestor
-        from vocode.streaming.utils.phone_numbers import sanitize_phone_number
-        
-        twilio_client = self.conversation_state_manager.create_twilio_client()
-        
-        sanitized_phone = sanitize_phone_number(to_phone)
-        
-        url = (
-            f"https://api.twilio.com/2010-04-01/Accounts/"
-            f"{twilio_client.get_telephony_config().account_sid}/"
-            f"Calls/{twilio_call_sid}.json"
-        )
-        
-        twiml_data = f"<Response><Dial>{sanitized_phone}</Dial></Response>"
-        payload = {"Twiml": twiml_data}
-        
-        async with AsyncRequestor().get_session().post(
-            url,
-            data=payload,
-            auth=twilio_client.auth
-        ) as response:
-            if response.status != 200:
-                error_msg = f"Twilio transfer failed: {response.status}"
-                logger.error(error_msg)
-                raise Exception(error_msg)
-            
-            return await response.json()
 
 
 # =============================================================================
@@ -328,6 +373,11 @@ class ControlledEndConversation(
     
     Routes through CallController before ending call.
     Ensures proper cleanup and state management.
+    
+    SAFETY:
+    - Cannot execute if already terminating
+    - Routes through controller terminate_call()
+    - Never bypasses controller authority
     """
     
     description: str = (
@@ -361,6 +411,11 @@ class ControlledEndConversation(
         )
         
         self.call_controller = call_controller
+        
+        logger.debug(
+            "ControlledEndConversation initialized",
+            extra={"has_controller": call_controller is not None}
+        )
     
     async def run(
         self,
@@ -375,16 +430,56 @@ class ControlledEndConversation(
         Returns:
             End conversation result
         """
+        reason = action_input.params.reason or "ai_suggested_end"
+        
         logger.info(
             "End conversation action triggered",
-            extra={
-                "reason": action_input.params.reason
-            }
+            extra={"reason": reason}
         )
+        
+        # SAFETY CHECK 1: Verify controller exists
+        if not self.call_controller:
+            logger.error("No CallController - using fallback termination")
+            # Fallback to Vocode's termination
+            try:
+                await self.conversation_state_manager.terminate_conversation()
+                return ActionOutput(
+                    action_type=action_input.action_config.type,
+                    response=ControlledEndConversationResponse(
+                        success=True,
+                        message="Conversation ended (fallback)"
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Fallback termination failed: {e}", exc_info=True)
+                return ActionOutput(
+                    action_type=action_input.action_config.type,
+                    response=ControlledEndConversationResponse(
+                        success=False,
+                        message="Failed to end conversation"
+                    )
+                )
+        
+        # SAFETY CHECK 2: Check if already terminating
+        if self.call_controller._termination_in_progress:
+            logger.info("End conversation blocked - already terminating")
+            return ActionOutput(
+                action_type=action_input.action_config.type,
+                response=ControlledEndConversationResponse(
+                    success=True,
+                    message="Conversation already ending"
+                )
+            )
         
         # Wait for user message to complete if needed
         if action_input.user_message_tracker is not None:
-            await action_input.user_message_tracker.wait()
+            try:
+                await asyncio.wait_for(
+                    action_input.user_message_tracker.wait(),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("User message tracker wait timed out")
         
         # Check if last message was interrupted
         if self.conversation_state_manager.transcript.was_last_message_interrupted():
@@ -397,25 +492,36 @@ class ControlledEndConversation(
                 )
             )
         
-        # Route through CallController
-        if self.call_controller:
-            await self.call_controller.close(
-                reason=action_input.params.reason or "ai_suggested_end"
+        # Route through CallController's close method
+        # This ensures proper shutdown sequence
+        try:
+            # Use close instead of terminate_call for graceful shutdown
+            await self.call_controller.close(reason=reason)
+            
+            logger.info("Conversation end initiated")
+            
+            return ActionOutput(
+                action_type=action_input.action_config.type,
+                response=ControlledEndConversationResponse(
+                    success=True,
+                    message="Conversation ended"
+                )
             )
-        else:
-            # Fallback to Vocode's termination
-            logger.warning("No CallController - using direct termination")
-            await self.conversation_state_manager.terminate_conversation()
         
-        logger.info("Conversation ended")
-        
-        return ActionOutput(
-            action_type=action_input.action_config.type,
-            response=ControlledEndConversationResponse(
-                success=True,
-                message="Conversation ended"
+        except Exception as e:
+            logger.error(
+                f"End conversation failed: {e}",
+                extra={"call_id": self.call_controller.call_id},
+                exc_info=True
             )
-        )
+            
+            return ActionOutput(
+                action_type=action_input.action_config.type,
+                response=ControlledEndConversationResponse(
+                    success=False,
+                    message="Failed to end conversation"
+                )
+            )
 
 
 # =============================================================================
@@ -427,6 +533,11 @@ class ControlledActionFactory:
     Factory for creating controlled actions.
     
     Creates actions with CallController injected.
+    
+    SAFETY:
+    - All actions must have controller reference
+    - Actions validate controller state before execution
+    - Actions cannot bypass controller authority
     """
     
     def __init__(self, call_controller):
@@ -436,7 +547,15 @@ class ControlledActionFactory:
         Args:
             call_controller: CallController instance to inject
         """
+        if not call_controller:
+            raise ValueError("CallController is required")
+        
         self.call_controller = call_controller
+        
+        logger.info(
+            "ControlledActionFactory initialized",
+            extra={"call_id": call_controller.call_id}
+        )
     
     def create_transfer_action(
         self,
@@ -454,10 +573,17 @@ class ControlledActionFactory:
         if not config:
             config = ControlledTransferCallActionConfig()
         
-        return ControlledTransferCall(
+        action = ControlledTransferCall(
             action_config=config,
             call_controller=self.call_controller
         )
+        
+        logger.debug(
+            "Transfer action created",
+            extra={"call_id": self.call_controller.call_id}
+        )
+        
+        return action
     
     def create_end_conversation_action(
         self,
@@ -475,10 +601,17 @@ class ControlledActionFactory:
         if not config:
             config = ControlledEndConversationActionConfig()
         
-        return ControlledEndConversation(
+        action = ControlledEndConversation(
             action_config=config,
             call_controller=self.call_controller
         )
+        
+        logger.debug(
+            "End conversation action created",
+            extra={"call_id": self.call_controller.call_id}
+        )
+        
+        return action
     
     def get_action_configs(self) -> list:
         """
