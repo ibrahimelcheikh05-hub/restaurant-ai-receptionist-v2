@@ -10,6 +10,7 @@ Responsibilities:
 - Handle barge-in and interruptions
 - Manage WebSocket lifecycle
 - ENFORCE hard shutdown of voice pipelines
+- Configure ElevenLabs TTS with streaming and language support
 
 This is the GLUE between Vocode's voice engine and our control layer.
 
@@ -25,6 +26,7 @@ SHUTDOWN RULES:
 
 import asyncio
 import logging
+import json
 from typing import Optional, Dict, Any, AsyncGenerator, Callable
 from datetime import datetime, timezone
 
@@ -41,7 +43,120 @@ from vocode.streaming.models.events import Event, EventType
 from vocode.streaming.output_device.twilio_output_device import TwilioOutputDevice
 from vocode.streaming.models.telephony import TwilioConfig
 
+# ElevenLabs imports
+try:
+    from vocode.streaming.synthesizer.eleven_labs_synthesizer import ElevenLabsSynthesizer
+    from vocode.streaming.models.synthesizer import ElevenLabsSynthesizerConfig
+    ELEVENLABS_AVAILABLE = True
+except ImportError:
+    ELEVENLABS_AVAILABLE = False
+
+from settings import get_settings
+
 logger = logging.getLogger(__name__)
+
+
+def create_elevenlabs_config(
+    voice_id: Optional[str] = None,
+    language_code: Optional[str] = None,
+    api_key: Optional[str] = None
+) -> Optional[SynthesizerConfig]:
+    """
+    Create ElevenLabs synthesizer configuration.
+    
+    Args:
+        voice_id: ElevenLabs voice ID (if None, uses default from settings)
+        language_code: Language code for voice mapping (e.g., 'en', 'es', 'ar')
+        api_key: ElevenLabs API key (if None, uses settings)
+        
+    Returns:
+        ElevenLabs synthesizer config or None if not available
+    """
+    if not ELEVENLABS_AVAILABLE:
+        logger.error("ElevenLabs synthesizer not available in Vocode installation")
+        return None
+    
+    settings = get_settings()
+    
+    # Get API key
+    if not api_key:
+        api_key = settings.speech.elevenlabs_api_key
+    
+    if not api_key:
+        logger.error("ElevenLabs API key not configured")
+        return None
+    
+    # Determine voice ID
+    if voice_id:
+        selected_voice_id = voice_id
+    elif language_code:
+        # Use language-specific voice if available
+        selected_voice_id = settings.get_voice_id_for_language(language_code)
+    else:
+        # Use default voice
+        selected_voice_id = settings.speech.elevenlabs_default_voice_id
+    
+    logger.info(
+        "Creating ElevenLabs config",
+        extra={
+            "voice_id": selected_voice_id,
+            "language": language_code
+        }
+    )
+    
+    try:
+        config = ElevenLabsSynthesizerConfig(
+            api_key=api_key,
+            voice_id=selected_voice_id,
+            stability=0.5,  # Voice stability (0-1)
+            similarity_boost=0.75,  # Voice similarity (0-1)
+            optimize_streaming_latency=4,  # Optimize for low latency (0-4)
+            should_encode_as_wav=True,  # Required for Twilio
+            sampling_rate=8000,  # Twilio uses 8kHz
+            audio_encoding="mulaw"  # Twilio requires mulaw
+        )
+        
+        return config
+    
+    except Exception as e:
+        logger.error(
+            f"Failed to create ElevenLabs config: {e}",
+            exc_info=True
+        )
+        return None
+
+
+def create_elevenlabs_synthesizer(
+    config: SynthesizerConfig
+) -> Optional[BaseSynthesizer]:
+    """
+    Create ElevenLabs synthesizer instance.
+    
+    Args:
+        config: ElevenLabs synthesizer configuration
+        
+    Returns:
+        ElevenLabs synthesizer or None on failure
+    """
+    if not ELEVENLABS_AVAILABLE:
+        logger.error("ElevenLabs not available")
+        return None
+    
+    if not isinstance(config, ElevenLabsSynthesizerConfig):
+        logger.error("Invalid ElevenLabs config type")
+        return None
+    
+    try:
+        synthesizer = ElevenLabsSynthesizer(config)
+        logger.info("ElevenLabs synthesizer created successfully")
+        return synthesizer
+    
+    except Exception as e:
+        logger.error(
+            f"Failed to create ElevenLabs synthesizer: {e}",
+            exc_info=True
+        )
+        return None
 
 
 class VocodeSession:
@@ -55,6 +170,7 @@ class VocodeSession:
     - Routes AI responses from CallController to Vocode
     - Handles interruptions and barge-in
     - Enforces hard shutdown when controller terminates
+    - Configures ElevenLabs TTS with language support
     
     CRITICAL RULES:
     - Controller owns this session
@@ -74,7 +190,8 @@ class VocodeSession:
         agent_config: AgentConfig,
         transcriber_factory,
         synthesizer_factory,
-        agent_factory
+        agent_factory,
+        language_code: Optional[str] = None
     ):
         """
         Initialize Vocode session.
@@ -89,10 +206,12 @@ class VocodeSession:
             transcriber_factory: Factory for creating transcriber
             synthesizer_factory: Factory for creating synthesizer
             agent_factory: Factory for creating agent
+            language_code: Detected language code for voice selection
         """
         self.call_id = call_id
         self.websocket = websocket
         self.twilio_config = twilio_config
+        self.language_code = language_code
         
         # Vocode configuration
         self.transcriber_config = transcriber_config
@@ -132,7 +251,10 @@ class VocodeSession:
         
         logger.info(
             "VocodeSession created",
-            extra={"call_id": call_id}
+            extra={
+                "call_id": call_id,
+                "language": language_code
+            }
         )
     
     def set_transcript_callback(self, callback: Callable) -> None:
@@ -148,11 +270,31 @@ class VocodeSession:
             extra={"call_id": self.call_id}
         )
     
+    def update_language(self, language_code: str) -> None:
+        """
+        Update session language and potentially switch voice.
+        
+        Args:
+            language_code: New language code
+        """
+        if self.language_code == language_code:
+            return
+        
+        logger.info(
+            f"Updating session language: {self.language_code} -> {language_code}",
+            extra={"call_id": self.call_id}
+        )
+        
+        self.language_code = language_code
+        
+        # Note: Voice switching during active call requires stopping
+        # and restarting synthesizer - should only be done at call start
+    
     async def start(self) -> None:
         """
         Start Vocode session.
         
-        Creates and starts StreamingConversation.
+        Creates and starts StreamingConversation with ElevenLabs TTS.
         """
         if self._started:
             logger.warning(
@@ -185,9 +327,18 @@ class VocodeSession:
                 extra={"call_id": self.call_id}
             )
             
-            self.synthesizer = self.synthesizer_factory.create_synthesizer(
-                self.synthesizer_config
-            )
+            # Create ElevenLabs synthesizer
+            self.synthesizer = self._create_elevenlabs_synthesizer()
+            if not self.synthesizer:
+                # Fallback to provided factory if ElevenLabs fails
+                logger.warning(
+                    "ElevenLabs creation failed, using fallback synthesizer",
+                    extra={"call_id": self.call_id}
+                )
+                self.synthesizer = self.synthesizer_factory.create_synthesizer(
+                    self.synthesizer_config
+                )
+            
             logger.debug(
                 "Synthesizer created",
                 extra={"call_id": self.call_id}
@@ -247,6 +398,48 @@ class VocodeSession:
             # Cleanup on failure
             await self._force_shutdown()
             raise
+    
+    def _create_elevenlabs_synthesizer(self) -> Optional[BaseSynthesizer]:
+        """
+        Create ElevenLabs synthesizer with proper configuration.
+        
+        Returns:
+            ElevenLabs synthesizer or None on failure
+        """
+        try:
+            # Create ElevenLabs config
+            elevenlabs_config = create_elevenlabs_config(
+                language_code=self.language_code
+            )
+            
+            if not elevenlabs_config:
+                logger.warning(
+                    "Could not create ElevenLabs config",
+                    extra={"call_id": self.call_id}
+                )
+                return None
+            
+            # Create synthesizer
+            synthesizer = create_elevenlabs_synthesizer(elevenlabs_config)
+            
+            if synthesizer:
+                logger.info(
+                    "ElevenLabs synthesizer created successfully",
+                    extra={
+                        "call_id": self.call_id,
+                        "voice_id": elevenlabs_config.voice_id
+                    }
+                )
+            
+            return synthesizer
+        
+        except Exception as e:
+            logger.error(
+                f"Error creating ElevenLabs synthesizer: {e}",
+                extra={"call_id": self.call_id},
+                exc_info=True
+            )
+            return None
     
     def _create_agent_wrapper(self) -> BaseAgent:
         """
@@ -823,7 +1016,8 @@ class VocodeSession:
             "shutdown_in_progress": self._shutdown_in_progress,
             "shutdown_complete": self._shutdown_complete,
             "duration": self.get_duration(),
-            "active_tasks": len(self._active_tasks)
+            "active_tasks": len(self._active_tasks),
+            "language": self.language_code
         }
     
     def __repr__(self) -> str:
