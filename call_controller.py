@@ -1346,6 +1346,24 @@ class CallController:
                 exc_info=True
             )
     
+    def get_language_config(self) -> Dict[str, Any]:
+        """
+        Get language configuration for STT/TTS.
+        
+        This provides the detected language to configure:
+        - Speech-to-text models
+        - Text-to-speech voices
+        
+        Returns:
+            Language configuration dict
+        """
+        return {
+            "language_code": self._detected_language or "en",
+            "is_locked": self._language_locked,
+            "confidence": self._language_confidence,
+            "detection_method": "detected" if self._language_confidence and self._language_confidence > 0 else "fallback"
+        }
+    
     def __repr__(self) -> str:
         """String representation."""
         return (
