@@ -1,9 +1,24 @@
 """
 Translator
 ==========
-Production translation service with timeout and fallback.
+FALLBACK-ONLY translation utility.
 
-Responsibilities:
+ARCHITECTURE NOTICE:
+This module is NO LONGER in the real-time call path.
+The system now uses TRUE MULTILINGUAL design:
+- STT → LLM → TTS (no translation)
+- LLM speaks user's language natively
+- Business logic is language-agnostic
+
+This translator is now ONLY for:
+- Emergency fallback scenarios
+- Development/testing utilities
+- Offline translation of static content
+- Administrative tools
+
+DO NOT use this in the hot path of live calls.
+
+Legacy Responsibilities (now deprecated for real-time):
 - Translate text between languages
 - Cache translations
 - Enforce timeouts
@@ -50,7 +65,8 @@ class TranslationResult(Enum):
     TIMEOUT = "timeout"
     ERROR = "error"
     DISABLED = "disabled"
-    REJECTED = "rejected"  # Added for safety
+    REJECTED = "rejected"
+    NOT_REQUIRED = "not_required"  # Added for true multilingual mode
 
 
 @dataclass
@@ -66,7 +82,7 @@ class TranslationResponse:
     target_language: str
     cached: bool = False
     latency_ms: float = 0.0
-    protected_tokens: int = 0  # Count of protected tokens
+    protected_tokens: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -206,10 +222,10 @@ class CanonicalKeyProtector:
         
         # Protect quantities
         for match in cls.QUANTITY_PATTERN.finditer(text):
-            qty = match.group(0)
+            quantity = match.group(0)
             placeholder = f"__QTY_{protected_count}__"
-            replacements[placeholder] = qty
-            text = text.replace(qty, placeholder, 1)
+            replacements[placeholder] = quantity
+            text = text.replace(quantity, placeholder, 1)
             protected_count += 1
         
         return text, replacements, protected_count
@@ -236,71 +252,54 @@ class TranslationCache:
     """
     Simple in-memory translation cache.
     
-    Caches translations to reduce API calls and latency.
+    Caches recent translations to avoid redundant API calls.
     """
     
-    def __init__(
-        self,
-        max_size: int = 1000,
-        ttl_seconds: int = 3600
-    ):
+    def __init__(self, max_size: int = 1000, ttl_seconds: int = 3600):
         """
         Initialize cache.
         
         Args:
             max_size: Maximum cache entries
-            ttl_seconds: Time-to-live in seconds
+            ttl_seconds: Time-to-live for cache entries
         """
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
-        
-        # Cache: key -> (translation, timestamp)
         self._cache: Dict[str, tuple[str, datetime]] = {}
     
     def _make_key(
         self,
         text: str,
-        source_lang: str,
-        target_lang: str
+        source: str,
+        target: str
     ) -> str:
-        """
-        Create cache key.
-        
-        Args:
-            text: Text to translate
-            source_lang: Source language
-            target_lang: Target language
-            
-        Returns:
-            Cache key
-        """
-        # Hash for shorter keys
-        content = f"{source_lang}:{target_lang}:{text}"
-        return hashlib.md5(content.encode()).hexdigest()
+        """Create cache key."""
+        data = f"{source}:{target}:{text}"
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
     
     def get(
         self,
         text: str,
-        source_lang: str,
-        target_lang: str
+        source: str,
+        target: str
     ) -> Optional[str]:
         """
         Get cached translation.
         
         Args:
-            text: Text to translate
-            source_lang: Source language
-            target_lang: Target language
+            text: Source text
+            source: Source language
+            target: Target language
             
         Returns:
             Cached translation or None
         """
-        key = self._make_key(text, source_lang, target_lang)
+        key = self._make_key(text, source, target)
         
         if key not in self._cache:
             return None
         
-        translation, timestamp = self._cache[key]
+        cached_text, timestamp = self._cache[key]
         
         # Check if expired
         age = (datetime.now(timezone.utc) - timestamp).total_seconds()
@@ -308,89 +307,95 @@ class TranslationCache:
             del self._cache[key]
             return None
         
-        return translation
+        return cached_text
     
     def set(
         self,
         text: str,
-        source_lang: str,
-        target_lang: str,
+        source: str,
+        target: str,
         translation: str
     ) -> None:
         """
-        Store translation in cache.
+        Cache translation.
         
         Args:
-            text: Original text
-            source_lang: Source language
-            target_lang: Target language
+            text: Source text
+            source: Source language
+            target: Target language
             translation: Translated text
         """
-        # Evict oldest if at max size
+        # Evict oldest if at capacity
         if len(self._cache) >= self.max_size:
-            # Remove oldest entry
             oldest_key = min(
                 self._cache.keys(),
                 key=lambda k: self._cache[k][1]
             )
             del self._cache[oldest_key]
         
-        key = self._make_key(text, source_lang, target_lang)
+        key = self._make_key(text, source, target)
         self._cache[key] = (translation, datetime.now(timezone.utc))
     
     def clear(self) -> None:
         """Clear cache."""
         self._cache.clear()
     
-    def size(self) -> int:
-        """Get cache size."""
-        return len(self._cache)
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        return {
+            "size": len(self._cache),
+            "max_size": self.max_size,
+            "ttl_seconds": self.ttl_seconds
+        }
 
 
 class Translator:
     """
-    Production translation service.
+    FALLBACK-ONLY translation service.
+    
+    WARNING: This is NO LONGER used in real-time call paths.
+    The system now uses true multilingual LLM responses.
+    
+    This translator is ONLY for:
+    - Emergency fallback scenarios
+    - Development utilities
+    - Offline content translation
+    - Administrative tools
     
     Features:
-    - Google Translate API integration
-    - Caching for performance
-    - Strict timeouts
-    - Graceful fallback
-    - Never blocks call flow
+    - Async translation with timeout
+    - Automatic caching
     - Canonical key protection
     - Text sanitization
-    
-    SAFETY:
-    - Protected tokens are never translated
-    - Text is sanitized before translation
-    - Suspicious content is rejected
-    - Length limits enforced
+    - Graceful degradation
     """
+    
+    DEFAULT_TIMEOUT = 3.0  # Timeout for translation API
     
     def __init__(
         self,
-        timeout: float = 2.0,
+        default_source: str = "auto",
+        default_target: str = "en",
+        timeout: float = DEFAULT_TIMEOUT,
         enable_cache: bool = True,
         cache_size: int = 1000,
-        cache_ttl: int = 3600,
-        protect_canonical_keys: bool = True,
-        sanitize_input: bool = True
+        cache_ttl: int = 3600
     ):
         """
         Initialize translator.
         
         Args:
-            timeout: Translation timeout in seconds
-            enable_cache: Enable caching
-            cache_size: Cache max size
+            default_source: Default source language
+            default_target: Default target language
+            timeout: API timeout in seconds
+            enable_cache: Enable translation caching
+            cache_size: Maximum cache entries
             cache_ttl: Cache TTL in seconds
-            protect_canonical_keys: Protect canonical keys from translation
-            sanitize_input: Sanitize input before translation
         """
+        self.default_source = default_source
+        self.default_target = default_target
         self.timeout = timeout
         self.enable_cache = enable_cache
-        self.protect_canonical_keys = protect_canonical_keys
-        self.sanitize_input = sanitize_input
         
         # Initialize cache
         self.cache = TranslationCache(
@@ -398,370 +403,216 @@ class Translator:
             ttl_seconds=cache_ttl
         ) if enable_cache else None
         
-        # Initialize Google Translate client
+        # Initialize Google Translate client if available
         self.client = None
         if GOOGLE_TRANSLATE_AVAILABLE:
             try:
                 self.client = translate.Client()
-                logger.info("Google Translate client initialized")
+                logger.info("Google Translate client initialized (FALLBACK ONLY)")
             except Exception as e:
-                logger.error(
-                    f"Failed to initialize Google Translate: {e}",
-                    exc_info=True
-                )
+                logger.error(f"Failed to initialize Google Translate: {e}")
+                self.client = None
         
-        # Metrics
-        self._total_translations = 0
-        self._cache_hits = 0
-        self._timeouts = 0
-        self._errors = 0
-        self._rejected = 0
-        self._protected_tokens = 0
+        # Statistics
+        self._stats = {
+            "total_requests": 0,
+            "cache_hits": 0,
+            "api_calls": 0,
+            "errors": 0,
+            "bypassed": 0
+        }
         
-        logger.info(
-            "Translator initialized",
-            extra={
-                "timeout": timeout,
-                "cache_enabled": enable_cache,
-                "protect_keys": protect_canonical_keys,
-                "sanitize": sanitize_input,
-                "google_available": GOOGLE_TRANSLATE_AVAILABLE
-            }
+        logger.warning(
+            "Translator initialized as FALLBACK ONLY utility - "
+            "NOT for use in real-time call paths"
         )
     
     async def translate(
         self,
         text: str,
-        source_language: str,
-        target_language: str,
-        call_id: Optional[str] = None
+        source: Optional[str] = None,
+        target: Optional[str] = None
     ) -> TranslationResponse:
         """
-        Translate text with safety protections.
+        Translate text (FALLBACK ONLY - not for real-time use).
+        
+        WARNING: Do not use in real-time call path.
+        Use true multilingual LLM instead.
         
         Args:
             text: Text to translate
-            source_language: Source language code
-            target_language: Target language code
-            call_id: Call identifier for logging
+            source: Source language (auto-detect if None)
+            target: Target language
             
         Returns:
-            Translation response (never raises exceptions)
+            Translation response
         """
-        start_time = datetime.now(timezone.utc)
+        logger.warning(
+            "translate() called - this should NOT be in real-time path"
+        )
         
-        # Validate inputs
-        if not text or not text.strip():
-            return TranslationResponse(
-                text="",
-                result=TranslationResult.BYPASSED,
-                source_language=source_language,
-                target_language=target_language
-            )
+        self._stats["total_requests"] += 1
         
-        # Same language - no translation needed
-        if source_language == target_language:
+        # Use defaults
+        source = source or self.default_source
+        target = target or self.default_target
+        
+        # Bypass if same language
+        if source == target and source != "auto":
+            self._stats["bypassed"] += 1
             return TranslationResponse(
                 text=text,
                 result=TranslationResult.BYPASSED,
-                source_language=source_language,
-                target_language=target_language
+                source_language=source,
+                target_language=target
             )
         
         # Sanitize input
-        protected_count = 0
-        replacements = {}
+        sanitized_text, is_safe = TextSanitizer.sanitize(text)
         
-        if self.sanitize_input:
-            text, is_safe = TextSanitizer.sanitize(text)
-            
-            if not is_safe:
-                self._rejected += 1
-                logger.error(
-                    "Unsafe text rejected for translation",
-                    extra={"call_id": call_id}
-                )
-                return TranslationResponse(
-                    text=text,  # Return sanitized original
-                    result=TranslationResult.REJECTED,
-                    source_language=source_language,
-                    target_language=target_language
-                )
-        
-        # Protect canonical keys
-        if self.protect_canonical_keys:
-            text, replacements, protected_count = (
-                CanonicalKeyProtector.protect_text(text)
-            )
-            
-            if protected_count > 0:
-                self._protected_tokens += protected_count
-                logger.debug(
-                    f"Protected {protected_count} tokens from translation",
-                    extra={"call_id": call_id}
-                )
-        
-        # Check if translation is available
-        if not GOOGLE_TRANSLATE_AVAILABLE or not self.client:
-            logger.warning("Translation not available - returning original")
-            
-            # Restore protected tokens if any
-            if replacements:
-                text = CanonicalKeyProtector.restore_text(text, replacements)
-            
+        if not is_safe:
+            self._stats["errors"] += 1
+            logger.error("Unsafe text rejected from translation")
             return TranslationResponse(
                 text=text,
-                result=TranslationResult.DISABLED,
-                source_language=source_language,
-                target_language=target_language,
-                protected_tokens=protected_count
+                result=TranslationResult.REJECTED,
+                source_language=source,
+                target_language=target
             )
         
-        # Check cache (use protected text for cache key)
+        if not sanitized_text:
+            return TranslationResponse(
+                text="",
+                result=TranslationResult.BYPASSED,
+                source_language=source,
+                target_language=target
+            )
+        
+        # Check cache
         if self.cache:
-            cached = self.cache.get(text, source_language, target_language)
+            cached = self.cache.get(sanitized_text, source, target)
             if cached:
-                self._cache_hits += 1
-                
-                # Restore protected tokens
-                if replacements:
-                    cached = CanonicalKeyProtector.restore_text(cached, replacements)
-                
-                latency_ms = (
-                    datetime.now(timezone.utc) - start_time
-                ).total_seconds() * 1000
-                
-                logger.debug(
-                    "Cache hit",
-                    extra={
-                        "source": source_language,
-                        "target": target_language,
-                        "call_id": call_id
-                    }
-                )
-                
+                self._stats["cache_hits"] += 1
                 return TranslationResponse(
                     text=cached,
                     result=TranslationResult.CACHED,
-                    source_language=source_language,
-                    target_language=target_language,
-                    cached=True,
-                    latency_ms=latency_ms,
-                    protected_tokens=protected_count
+                    source_language=source,
+                    target_language=target,
+                    cached=True
                 )
         
-        # Perform translation with timeout
+        # Protect canonical keys
+        protected_text, replacements, protected_count = (
+            CanonicalKeyProtector.protect_text(sanitized_text)
+        )
+        
+        # Translate
+        start_time = datetime.now(timezone.utc)
+        
         try:
-            translation = await asyncio.wait_for(
-                self._do_translation(
-                    text,
-                    source_language,
-                    target_language
+            if not self.client:
+                self._stats["errors"] += 1
+                return TranslationResponse(
+                    text=text,
+                    result=TranslationResult.DISABLED,
+                    source_language=source,
+                    target_language=target
+                )
+            
+            # Call Google Translate with timeout
+            translation_result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.client.translate(
+                        protected_text,
+                        target_language=target,
+                        source_language=source if source != "auto" else None
+                    )
                 ),
                 timeout=self.timeout
             )
             
+            translated_text = translation_result["translatedText"]
+            detected_source = translation_result.get("detectedSourceLanguage", source)
+            
             # Restore protected tokens
-            if replacements:
-                translation = CanonicalKeyProtector.restore_text(
-                    translation,
-                    replacements
-                )
-            
-            # Store in cache (use protected text for key)
-            if self.cache:
-                # Cache the translated version with placeholders
-                # so future identical requests benefit
-                cache_text = text  # Protected version
-                cache_translation = translation
-                if replacements:
-                    # Re-protect for cache
-                    cache_translation, _, _ = CanonicalKeyProtector.protect_text(
-                        translation
-                    )
-                
-                self.cache.set(
-                    cache_text,
-                    source_language,
-                    target_language,
-                    cache_translation
-                )
-            
-            self._total_translations += 1
-            
-            latency_ms = (
-                datetime.now(timezone.utc) - start_time
-            ).total_seconds() * 1000
-            
-            logger.debug(
-                f"Translation success: {source_language} -> {target_language}",
-                extra={
-                    "latency_ms": latency_ms,
-                    "call_id": call_id,
-                    "protected_tokens": protected_count
-                }
+            restored_text = CanonicalKeyProtector.restore_text(
+                translated_text,
+                replacements
             )
             
+            # Calculate latency
+            latency = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            
+            # Cache result
+            if self.cache:
+                self.cache.set(sanitized_text, source, target, restored_text)
+            
+            self._stats["api_calls"] += 1
+            
             return TranslationResponse(
-                text=translation,
+                text=restored_text,
                 result=TranslationResult.SUCCESS,
-                source_language=source_language,
-                target_language=target_language,
-                cached=False,
-                latency_ms=latency_ms,
+                source_language=detected_source,
+                target_language=target,
+                latency_ms=latency,
                 protected_tokens=protected_count
             )
         
         except asyncio.TimeoutError:
-            self._timeouts += 1
-            logger.warning(
-                f"Translation timeout after {self.timeout}s",
-                extra={
-                    "source": source_language,
-                    "target": target_language,
-                    "call_id": call_id
-                }
-            )
-            
-            # Restore protected tokens before returning
-            result_text = text
-            if replacements:
-                result_text = CanonicalKeyProtector.restore_text(text, replacements)
-            
-            # Return original text on timeout
+            self._stats["errors"] += 1
+            logger.error(f"Translation timeout after {self.timeout}s")
             return TranslationResponse(
-                text=result_text,
+                text=text,
                 result=TranslationResult.TIMEOUT,
-                source_language=source_language,
-                target_language=target_language,
-                protected_tokens=protected_count
+                source_language=source,
+                target_language=target
             )
         
         except Exception as e:
-            self._errors += 1
-            logger.error(
-                f"Translation error: {e}",
-                extra={
-                    "source": source_language,
-                    "target": target_language,
-                    "call_id": call_id
-                },
-                exc_info=True
-            )
-            
-            # Restore protected tokens before returning
-            result_text = text
-            if replacements:
-                result_text = CanonicalKeyProtector.restore_text(text, replacements)
-            
-            # Return original text on error
+            self._stats["errors"] += 1
+            logger.error(f"Translation error: {e}", exc_info=True)
             return TranslationResponse(
-                text=result_text,
+                text=text,
                 result=TranslationResult.ERROR,
-                source_language=source_language,
-                target_language=target_language,
-                protected_tokens=protected_count
+                source_language=source,
+                target_language=target
             )
-    
-    async def _do_translation(
-        self,
-        text: str,
-        source_language: str,
-        target_language: str
-    ) -> str:
-        """
-        Perform actual translation (async wrapper).
-        
-        Args:
-            text: Text to translate (may contain placeholders)
-            source_language: Source language
-            target_language: Target language
-            
-        Returns:
-            Translated text (with placeholders preserved)
-        """
-        # Google Translate API is sync, run in executor
-        loop = asyncio.get_event_loop()
-        
-        def _translate_sync():
-            result = self.client.translate(
-                text,
-                source_language=source_language,
-                target_language=target_language
-            )
-            return result['translatedText']
-        
-        return await loop.run_in_executor(None, _translate_sync)
-    
-    async def translate_to_english(
-        self,
-        text: str,
-        source_language: str,
-        call_id: Optional[str] = None
-    ) -> TranslationResponse:
-        """
-        Translate to English.
-        
-        Args:
-            text: Text to translate
-            source_language: Source language
-            call_id: Call identifier
-            
-        Returns:
-            Translation response
-        """
-        return await self.translate(text, source_language, "en", call_id)
-    
-    async def translate_from_english(
-        self,
-        text: str,
-        target_language: str,
-        call_id: Optional[str] = None
-    ) -> TranslationResponse:
-        """
-        Translate from English.
-        
-        Args:
-            text: Text to translate
-            target_language: Target language
-            call_id: Call identifier
-            
-        Returns:
-            Translation response
-        """
-        return await self.translate(text, "en", target_language, call_id)
     
     def get_stats(self) -> Dict[str, Any]:
         """
         Get translator statistics.
         
         Returns:
-            Statistics dictionary
+            Statistics dict
         """
-        stats = {
-            "total_translations": self._total_translations,
-            "cache_hits": self._cache_hits,
-            "timeouts": self._timeouts,
-            "errors": self._errors,
-            "rejected": self._rejected,
-            "protected_tokens": self._protected_tokens,
-            "cache_size": self.cache.size() if self.cache else 0
-        }
+        stats = self._stats.copy()
         
-        total_attempts = self._total_translations + self._cache_hits
-        if total_attempts > 0:
-            stats["cache_hit_rate"] = self._cache_hits / total_attempts
+        if self.cache:
+            stats["cache"] = self.cache.get_stats()
+        
+        stats["cache_hit_rate"] = (
+            self._stats["cache_hits"] / max(1, self._stats["total_requests"])
+        )
         
         return stats
+    
+    def clear_cache(self) -> None:
+        """Clear translation cache."""
+        if self.cache:
+            self.cache.clear()
+            logger.info("Translation cache cleared")
 
 
-# Default instance
+# Default instance (FALLBACK ONLY)
 _default_translator: Optional[Translator] = None
 
 
 def get_default_translator() -> Translator:
     """
-    Get or create default translator.
+    Get or create default translator (FALLBACK ONLY).
+    
+    WARNING: Not for use in real-time call paths.
     
     Returns:
         Default translator instance
@@ -774,40 +625,23 @@ def get_default_translator() -> Translator:
     return _default_translator
 
 
-def set_default_translator(translator: Translator) -> None:
-    """
-    Set default translator.
-    
-    Args:
-        translator: Translator instance
-    """
-    global _default_translator
-    _default_translator = translator
-    logger.info("Default translator set")
-
-
 async def translate_text(
     text: str,
-    source_language: str,
-    target_language: str,
-    call_id: Optional[str] = None
+    source: Optional[str] = None,
+    target: Optional[str] = None
 ) -> TranslationResponse:
     """
-    Quick translation using default translator.
+    Quick translation utility (FALLBACK ONLY).
+    
+    WARNING: Do not use in real-time call path.
     
     Args:
         text: Text to translate
-        source_language: Source language
-        target_language: Target language
-        call_id: Call identifier
+        source: Source language
+        target: Target language
         
     Returns:
         Translation response
     """
     translator = get_default_translator()
-    return await translator.translate(
-        text,
-        source_language,
-        target_language,
-        call_id
-    )
+    return await translator.translate(text, source, target)
