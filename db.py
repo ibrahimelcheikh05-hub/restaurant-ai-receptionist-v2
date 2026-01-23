@@ -9,6 +9,8 @@ Responsibilities:
 - Connection pooling
 - Transaction support
 - Error handling
+- Business & FAQ data access
+- Greeting and closing message retrieval
 """
 
 import logging
@@ -383,6 +385,33 @@ class Database:
         
         return await self.fetch_all(query, tenant_id)
     
+    async def get_business_info(
+        self,
+        tenant_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get business information for tenant.
+        
+        Args:
+            tenant_id: Tenant identifier
+            
+        Returns:
+            Business info dict or None
+        """
+        query = """
+            SELECT 
+                name,
+                address,
+                phone,
+                hours,
+                description
+            FROM tenants
+            WHERE tenant_id = $1
+        """
+        
+        result = await self.fetch_one(query, tenant_id)
+        return result
+    
     async def __aenter__(self):
         """Async context manager entry."""
         await self.initialize()
@@ -439,3 +468,240 @@ async def store_order(order_data: Dict[str, Any]) -> bool:
     """
     db = get_default_db()
     return await db.store_order(order_data)
+
+
+# =========================================================================
+# System-Controlled Message Retrieval Functions
+# =========================================================================
+
+# Mock data for greetings (will be replaced with DB queries in production)
+_MOCK_GREETINGS = {
+    "default_tenant": {
+        "en": "Thank you for calling! How can I help you today?",
+        "es": "¡Gracias por llamar! ¿Cómo puedo ayudarte hoy?",
+        "ar": "شكرا لك على الاتصال! كيف يمكنني مساعدتك اليوم؟"
+    }
+}
+
+# Mock data for closing messages
+_MOCK_CLOSINGS = {
+    "default_tenant": {
+        "normal": {
+            "en": "Thank you for calling. Have a great day!",
+            "es": "Gracias por llamar. ¡Que tengas un gran día!",
+            "ar": "شكرا لك على الاتصال. أتمنى لك يوما عظيما!"
+        },
+        "order_complete": {
+            "en": "Thank you for your order! We'll have it ready soon. Have a great day!",
+            "es": "¡Gracias por tu orden! Lo tendremos listo pronto. ¡Que tengas un gran día!",
+            "ar": "شكرا لك على طلبك! سنجهزه قريبا. أتمنى لك يوما عظيما!"
+        },
+        "transfer": {
+            "en": "Transferring you now. Please hold.",
+            "es": "Transfiriéndote ahora. Por favor espera.",
+            "ar": "نحيلك الآن. يرجى الانتظار."
+        }
+    }
+}
+
+# Mock data for FAQ answers
+_MOCK_FAQS = {
+    "default_tenant": {
+        "hours": {
+            "en": "We're open Monday through Friday, 11 AM to 9 PM, and weekends from 10 AM to 10 PM.",
+            "es": "Estamos abiertos de lunes a viernes, de 11 AM a 9 PM, y los fines de semana de 10 AM a 10 PM.",
+            "ar": "نحن مفتوحون من الاثنين إلى الجمعة، من 11 صباحًا إلى 9 مساءً، وعطلات نهاية الأسبوع من 10 صباحًا إلى 10 مساءً."
+        },
+        "location": {
+            "en": "We're located at 123 Main Street, downtown. There's parking available in the lot behind the building.",
+            "es": "Estamos ubicados en 123 Main Street, en el centro. Hay estacionamiento disponible en el lote detrás del edificio.",
+            "ar": "نحن موجودون في 123 Main Street، وسط المدينة. يتوفر موقف سيارات في الساحة خلف المبنى."
+        },
+        "delivery": {
+            "en": "We offer delivery within 5 miles. Delivery fee is $3.99 and takes about 30-45 minutes.",
+            "es": "Ofrecemos entrega dentro de 5 millas. La tarifa de entrega es de $3.99 y toma alrededor de 30-45 minutos.",
+            "ar": "نقدم التوصيل ضمن 5 أميال. رسوم التوصيل 3.99 دولار ويستغرق حوالي 30-45 دقيقة."
+        },
+        "parking": {
+            "en": "We have a parking lot behind the building with free parking for customers.",
+            "es": "Tenemos un estacionamiento detrás del edificio con estacionamiento gratuito para clientes.",
+            "ar": "لدينا موقف سيارات خلف المبنى مع مواقف مجانية للعملاء."
+        }
+    }
+}
+
+
+async def get_greeting(
+    tenant_id: str,
+    language: str = "en"
+) -> str:
+    """
+    Get greeting message for tenant and language.
+    
+    Args:
+        tenant_id: Tenant identifier
+        language: Language code (e.g., 'en', 'es', 'ar')
+        
+    Returns:
+        Greeting message text
+    """
+    try:
+        # Try to get from database first
+        db = get_default_db()
+        
+        # In production, query database:
+        # query = """
+        #     SELECT greeting_text
+        #     FROM greetings
+        #     WHERE tenant_id = $1 AND language = $2
+        # """
+        # result = await db.fetch_one(query, tenant_id, language)
+        # if result:
+        #     return result.get("greeting_text", "")
+        
+        # For now, use mock data
+        tenant_greetings = _MOCK_GREETINGS.get(tenant_id, _MOCK_GREETINGS.get("default_tenant", {}))
+        greeting = tenant_greetings.get(language, tenant_greetings.get("en", ""))
+        
+        if greeting:
+            logger.info(
+                f"Greeting retrieved: {tenant_id}, {language}",
+                extra={"tenant_id": tenant_id, "language": language}
+            )
+            return greeting
+        
+        # Fallback
+        return "Thank you for calling. How can I help you?"
+    
+    except Exception as e:
+        logger.error(
+            f"Error getting greeting: {e}",
+            extra={"tenant_id": tenant_id, "language": language},
+            exc_info=True
+        )
+        return "Thank you for calling. How can I help you?"
+
+
+async def get_closing_message(
+    tenant_id: str,
+    reason: str = "normal",
+    language: str = "en"
+) -> str:
+    """
+    Get closing message for tenant, reason, and language.
+    
+    Args:
+        tenant_id: Tenant identifier
+        reason: Closing reason (e.g., 'normal', 'order_complete', 'transfer')
+        language: Language code (e.g., 'en', 'es', 'ar')
+        
+    Returns:
+        Closing message text
+    """
+    try:
+        # Try to get from database first
+        db = get_default_db()
+        
+        # In production, query database:
+        # query = """
+        #     SELECT closing_text
+        #     FROM closing_messages
+        #     WHERE tenant_id = $1 AND reason = $2 AND language = $3
+        # """
+        # result = await db.fetch_one(query, tenant_id, reason, language)
+        # if result:
+        #     return result.get("closing_text", "")
+        
+        # For now, use mock data
+        tenant_closings = _MOCK_CLOSINGS.get(tenant_id, _MOCK_CLOSINGS.get("default_tenant", {}))
+        reason_closings = tenant_closings.get(reason, tenant_closings.get("normal", {}))
+        closing = reason_closings.get(language, reason_closings.get("en", ""))
+        
+        if closing:
+            logger.info(
+                f"Closing message retrieved: {tenant_id}, {reason}, {language}",
+                extra={"tenant_id": tenant_id, "reason": reason, "language": language}
+            )
+            return closing
+        
+        # Fallback
+        return "Thank you for calling. Goodbye!"
+    
+    except Exception as e:
+        logger.error(
+            f"Error getting closing message: {e}",
+            extra={"tenant_id": tenant_id, "reason": reason, "language": language},
+            exc_info=True
+        )
+        return "Thank you for calling. Goodbye!"
+
+
+async def get_faq_answer(
+    tenant_id: str,
+    intent: str,
+    language: str = "en"
+) -> Optional[str]:
+    """
+    Get FAQ answer for tenant, intent, and language.
+    
+    Args:
+        tenant_id: Tenant identifier
+        intent: FAQ intent (e.g., 'hours', 'location', 'delivery')
+        language: Language code (e.g., 'en', 'es', 'ar')
+        
+    Returns:
+        FAQ answer text or None if not found
+    """
+    try:
+        # Try to get from database first
+        db = get_default_db()
+        
+        # In production, query database:
+        # query = """
+        #     SELECT answer_text
+        #     FROM faq_answers
+        #     WHERE tenant_id = $1 AND intent = $2 AND language = $3
+        # """
+        # result = await db.fetch_one(query, tenant_id, intent, language)
+        # if result:
+        #     return result.get("answer_text")
+        
+        # For now, use mock data
+        tenant_faqs = _MOCK_FAQS.get(tenant_id, _MOCK_FAQS.get("default_tenant", {}))
+        intent_faqs = tenant_faqs.get(intent, {})
+        answer = intent_faqs.get(language, intent_faqs.get("en"))
+        
+        if answer:
+            logger.info(
+                f"FAQ answer retrieved: {tenant_id}, {intent}, {language}",
+                extra={"tenant_id": tenant_id, "intent": intent, "language": language}
+            )
+            return answer
+        
+        logger.debug(
+            f"No FAQ answer found: {tenant_id}, {intent}, {language}",
+            extra={"tenant_id": tenant_id, "intent": intent, "language": language}
+        )
+        return None
+    
+    except Exception as e:
+        logger.error(
+            f"Error getting FAQ answer: {e}",
+            extra={"tenant_id": tenant_id, "intent": intent, "language": language},
+            exc_info=True
+        )
+        return None
+
+
+async def get_business_info(tenant_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Get business information for tenant.
+    
+    Args:
+        tenant_id: Tenant identifier
+        
+    Returns:
+        Business info dict or None
+    """
+    db = get_default_db()
+    return await db.get_business_info(tenant_id)
