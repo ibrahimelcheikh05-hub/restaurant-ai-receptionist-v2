@@ -536,18 +536,43 @@ class VocodeServer:
                 )
             
             # Return TwiML to connect WebSocket
-            twiml = get_connection_twiml(
-                base_url=self.base_url,
-                call_id=call_id
-            )
+            # Generate TwiML manually to avoid vocode's broken get_connection_twiml
+            
+            # Convert BASE_URL to WebSocket URL
+            base_url_fixed = self.base_url
+            if base_url_fixed.startswith('http://'):
+                ws_base = base_url_fixed.replace('http://', 'ws://')
+            elif base_url_fixed.startswith('https://'):
+                ws_base = base_url_fixed.replace('https://', 'wss://')
+            else:
+                # BASE_URL doesn't have protocol - add wss://
+                ws_base = f'wss://{base_url_fixed}'
+            
+            ws_url = f"{ws_base}/connect/{call_id}"
+            
+            # Generate valid TwiML
+            twiml_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{ws_url}">
+            <Parameter name="call_id" value="{call_id}" />
+            <Parameter name="call_sid" value="{call_sid}" />
+        </Stream>
+    </Connect>
+</Response>'''
             
             logger.info(
                 "TwiML returned for call",
-                extra={"call_id": call_id, "call_sid": call_sid}
+                extra={
+                    "call_id": call_id, 
+                    "call_sid": call_sid,
+                    "ws_url": ws_url,
+                    "base_url": self.base_url
+                }
             )
             
             return PlainTextResponse(
-                content=str(twiml),
+                content=twiml_content,
                 media_type="application/xml"
             )
         
