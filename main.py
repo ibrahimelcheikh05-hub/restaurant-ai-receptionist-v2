@@ -20,7 +20,6 @@ from vocode_server import VocodeServer
 from vocode.streaming.telephony.config_manager.in_memory_config_manager import (
     InMemoryConfigManager
 )
-from vocode.streaming.models.message import BaseMessage
 
 
 async def initialize_system() -> None:
@@ -334,52 +333,13 @@ if errors:
 # Create Vocode config manager
 config_manager = InMemoryConfigManager()
 
-# Configure Twilio with speech services
-from vocode.streaming.models.telephony import TwilioConfig
-from vocode.streaming.models.transcriber import DeepgramTranscriberConfig
-from vocode.streaming.models.synthesizer import ElevenLabsSynthesizerConfig
-from vocode.streaming.models.agent import ChatGPTAgentConfig
-from vocode.streaming.models.audio import AudioEncoding
-
-logger.info("Configuring Twilio with speech services")
-
-# Create Twilio config with Deepgram and ElevenLabs
-twilio_config = TwilioConfig(
-    account_sid=settings.vocode.twilio_account_sid,
-    auth_token=settings.vocode.twilio_auth_token,
-    # Transcriber (Speech-to-Text)
-    transcriber_config=DeepgramTranscriberConfig(
-        sampling_rate=8000,
-        audio_encoding=AudioEncoding.MULAW,
-        chunk_size=20 * 160,  # 20ms chunks at 8kHz
-        model="nova-2-phonecall",
-        language="en-US"
-    ),
-    # Synthesizer (Text-to-Speech)
-    synthesizer_config=ElevenLabsSynthesizerConfig(
-        sampling_rate=8000,
-        audio_encoding=AudioEncoding.MULAW,
-        api_key=settings.speech.elevenlabs_api_key,
-        voice_id=settings.speech.elevenlabs_default_voice_id,
-        model_id="eleven_turbo_v2"
-    ),
-    # Agent (we override this with handlers but vocode needs it)
-    agent_config=ChatGPTAgentConfig(
-        openai_api_key=settings.ai.openai_api_key,
-        model_name=settings.ai.openai_primary_model,
-        temperature=settings.ai.openai_temperature,
-        prompt_preamble="You are a helpful restaurant phone assistant.",
-        initial_message=BaseMessage(text="Hello")
-    )
-)
-
-logger.info("Twilio config created with Deepgram and ElevenLabs")
+logger.info("Config manager initialized - vocode will use API keys from environment")
 
 # Create Vocode server - this creates the FastAPI app
+# Vocode will automatically use DEEPGRAM_API_KEY and ELEVENLABS_API_KEY from environment
 server = VocodeServer(
     base_url=settings.vocode.base_url,
     config_manager=config_manager,
-    twilio_config=twilio_config,
     handler_factory=create_event_handlers
 )
 
