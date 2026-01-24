@@ -368,6 +368,7 @@ twilio_config = TwilioConfig(
         openai_api_key=settings.ai.openai_api_key,
         model_name=settings.ai.openai_primary_model,
         temperature=settings.ai.openai_temperature,
+        prompt_preamble="You are a helpful restaurant phone assistant.",
         initial_message=BaseMessage(text="Hello")
     )
 )
