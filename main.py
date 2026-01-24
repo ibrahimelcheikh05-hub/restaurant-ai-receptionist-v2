@@ -331,55 +331,53 @@ if errors:
     if settings.environment != "production":
         sys.exit(1)
 
-# Configure vocode with speech services
-from vocode.streaming.models.transcriber import DeepgramTranscriberConfig
-from vocode.streaming.models.synthesizer import ElevenLabsSynthesizerConfig
-from vocode.streaming.models.agent import ChatGPTAgentConfig
-from vocode.streaming.models.audio import AudioEncoding
-
 # Create Vocode config manager
 config_manager = InMemoryConfigManager()
 
-# Configure Deepgram (Speech-to-Text)
-logger.info("Configuring Deepgram transcriber")
-transcriber_config = DeepgramTranscriberConfig(
-    sampling_rate=8000,  # Phone quality
-    audio_encoding=AudioEncoding.MULAW,  # Twilio uses mulaw
-    chunk_size=20 * 160,  # 20ms chunks at 8kHz
-    model="nova-2-phonecall",  # Best for phone calls
-    tier="nova",
-    language="en-US"
-)
-config_manager.set_transcriber_config(transcriber_config)
+# Configure Twilio with speech services
+from vocode.streaming.models.telephony import TwilioConfig
+from vocode.streaming.models.transcriber import DeepgramTranscriberConfig, Transcriber
+from vocode.streaming.models.synthesizer import ElevenLabsSynthesizerConfig, AzureSynthesizerConfig
+from vocode.streaming.models.agent import ChatGPTAgentConfig
+from vocode.streaming.models.audio import AudioEncoding
 
-# Configure ElevenLabs (Text-to-Speech)
-logger.info("Configuring ElevenLabs synthesizer")
-synthesizer_config = ElevenLabsSynthesizerConfig(
-    sampling_rate=8000,  # Phone quality
-    audio_encoding=AudioEncoding.MULAW,  # Twilio uses mulaw
-    api_key=settings.speech.elevenlabs_api_key,
-    voice_id=settings.speech.elevenlabs_default_voice_id,
-    model_id="eleven_turbo_v2",  # Fast model for real-time
-    optimize_streaming_latency=4  # Optimize for streaming
-)
-config_manager.set_synthesizer_config(synthesizer_config)
+logger.info("Configuring Twilio with speech services")
 
-# Configure minimal agent (vocode requires this even though we override it)
-logger.info("Configuring ChatGPT agent")
-agent_config = ChatGPTAgentConfig(
-    openai_api_key=settings.ai.openai_api_key,
-    initial_message=BaseMessage(text="Hello"),
-    model_name=settings.ai.openai_primary_model,
-    temperature=settings.ai.openai_temperature
+# Create Twilio config with Deepgram and ElevenLabs
+twilio_config = TwilioConfig(
+    account_sid=settings.vocode.twilio_account_sid,
+    auth_token=settings.vocode.twilio_auth_token,
+    # Transcriber (Speech-to-Text)
+    transcriber_config=DeepgramTranscriberConfig(
+        sampling_rate=8000,
+        audio_encoding=AudioEncoding.MULAW,
+        model="nova-2-phonecall",
+        language="en-US"
+    ),
+    # Synthesizer (Text-to-Speech)
+    synthesizer_config=ElevenLabsSynthesizerConfig(
+        sampling_rate=8000,
+        audio_encoding=AudioEncoding.MULAW,
+        api_key=settings.speech.elevenlabs_api_key,
+        voice_id=settings.speech.elevenlabs_default_voice_id,
+        model_id="eleven_turbo_v2"
+    ),
+    # Agent (we override this with handlers but vocode needs it)
+    agent_config=ChatGPTAgentConfig(
+        openai_api_key=settings.ai.openai_api_key,
+        model_name=settings.ai.openai_primary_model,
+        temperature=settings.ai.openai_temperature,
+        initial_message=BaseMessage(text="Hello")
+    )
 )
-config_manager.set_agent_config(agent_config)
 
-logger.info("Vocode configuration complete")
+logger.info("Twilio config created with Deepgram and ElevenLabs")
 
 # Create Vocode server - this creates the FastAPI app
 server = VocodeServer(
     base_url=settings.vocode.base_url,
     config_manager=config_manager,
+    twilio_config=twilio_config,
     handler_factory=create_event_handlers
 )
 
