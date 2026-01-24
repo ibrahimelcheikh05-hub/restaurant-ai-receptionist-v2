@@ -69,7 +69,13 @@ async def initialize_system() -> None:
     logger.info("System initialization complete")
 
 
-def create_event_handlers(call_id: str, tenant_id: str) -> dict:
+def create_event_handlers(
+    call_id: str, 
+    tenant_id: str,
+    call_sid: str = None,
+    from_phone: str = None,
+    to_phone: str = None
+) -> dict:
     """
     Create event handlers for CallController.
     
@@ -79,6 +85,9 @@ def create_event_handlers(call_id: str, tenant_id: str) -> dict:
     Args:
         call_id: Call identifier
         tenant_id: Tenant identifier
+        call_sid: Twilio call SID (optional)
+        from_phone: Caller phone number (optional)
+        to_phone: Destination phone number (optional)
         
     Returns:
         Dict of handler functions
