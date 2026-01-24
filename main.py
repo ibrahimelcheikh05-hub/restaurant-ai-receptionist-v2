@@ -351,6 +351,7 @@ twilio_config = TwilioConfig(
     transcriber_config=DeepgramTranscriberConfig(
         sampling_rate=8000,
         audio_encoding=AudioEncoding.MULAW,
+        chunk_size=20 * 160,  # 20ms chunks at 8kHz
         model="nova-2-phonecall",
         language="en-US"
     ),
