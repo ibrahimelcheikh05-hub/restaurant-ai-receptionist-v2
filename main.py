@@ -1,9 +1,14 @@
 """
-Main Entry Point
-=================
-Application entry point for Restaurant AI Receptionist.
+Main Entry Point (No Vocode)
+=============================
+Restaurant AI Receptionist - Direct Twilio implementation.
 
-Initializes all components and starts the Vocode telephony server.
+Features:
+- No vocode dependency
+- Direct Twilio Media Streams
+- Low latency audio streaming
+- Barge-in support
+- Your custom handlers intact
 """
 
 import asyncio
@@ -16,10 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from settings import get_settings
 from observability import setup_logging, get_events, get_health
-from vocode_server import VocodeServer
-from vocode.streaming.telephony.config_manager.in_memory_config_manager import (
-    InMemoryConfigManager
-)
+from twilio_server import TwilioServer
 
 
 async def initialize_system() -> None:
@@ -56,8 +58,8 @@ async def initialize_system() -> None:
         from sms import get_default_client as get_sms_client
         from tenant_config import get_default_manager as get_tenant_manager
         
-        # Instantiate singletons (async ones need await)
-        await get_default_client()  # This is async!
+        # Instantiate singletons
+        await get_default_client()
         get_default_detector()
         get_default_translator()
         get_menu_engine()
@@ -87,23 +89,7 @@ def create_event_handlers(
     from_phone: str = None,
     to_phone: str = None
 ) -> dict:
-    """
-    Create event handlers for CallController.
-    
-    This factory function creates the handlers that implement
-    business logic for each call.
-    
-    Args:
-        call_id: Call identifier
-        tenant_id: Tenant identifier  
-        call_sid: Twilio call SID (optional)
-        from_phone: Caller phone number (optional)
-        to_phone: Destination phone number (optional)
-        
-    Returns:
-        Dict of handler functions
-    """
-    # Import with CORRECT function names
+    """Create event handlers for CallController."""
     from menu_engine import get_default_engine as get_menu_engine
     from order_engine import get_default_engine as get_order_engine
     from upsell_engine import get_default_engine as get_upsell_engine
@@ -113,14 +99,14 @@ def create_event_handlers(
     from safety import get_default_filter as get_safety_filter
     from detector import get_default_detector
     from translator import get_default_translator
-    from conversation_memory import create_memory, get_memory
+    from conversation_memory import create_memory
     from sms import send_order_confirmation
     from tenant_config import get_tenant_config
     
     logger = logging.getLogger(__name__)
     logger.info(f"Creating event handlers for call {call_id}")
     
-    # Get engines (these are synchronous singletons)
+    # Get engines
     menu_engine = get_menu_engine()
     order_engine = get_order_engine()
     upsell_engine = get_upsell_engine()
@@ -139,7 +125,6 @@ def create_event_handlers(
     async def on_greeting(**kwargs):
         """Handle greeting."""
         try:
-            # Get tenant config
             config = await get_tenant_config(tenant_id)
             greeting = config.greeting_message if config else "Thank you for calling! How can I help you today?"
             
@@ -153,40 +138,6 @@ def create_event_handlers(
                 "greeting": "Thank you for calling! How can I help you today?",
                 "language": "en"
             }
-    
-    async def on_language_detect(transcript: str, **kwargs):
-        """Handle language detection."""
-        try:
-            result = detector.detect(call_id, transcript, is_final=True)
-            
-            return {
-                "language": result.language,
-                "confidence": result.confidence
-            }
-        except Exception as e:
-            logger.error(f"Error in language detection: {e}")
-            return {
-                "language": "en",
-                "confidence": 1.0
-            }
-    
-    async def on_translate_to_english(text: str, source_language: str, **kwargs):
-        """Translate to English."""
-        try:
-            result = await translator.translate_to_english(text, source_language)
-            return {"translated_text": result.text}
-        except Exception as e:
-            logger.error(f"Translation error: {e}")
-            return {"translated_text": text}
-    
-    async def on_translate_from_english(text: str, target_language: str, **kwargs):
-        """Translate from English."""
-        try:
-            result = await translator.translate_from_english(text, target_language)
-            return {"translated_text": result.text}
-        except Exception as e:
-            logger.error(f"Translation error: {e}")
-            return {"translated_text": text}
     
     async def on_ai_request(user_text: str, turn_count: int, **kwargs):
         """Handle AI request."""
@@ -217,7 +168,7 @@ def create_event_handlers(
                 upsell_suggestions=upsell_text
             )
             
-            # Call LLM (this is async!)
+            # Call LLM
             llm_client = await get_llm_client()
             response = await llm_client.complete(messages, call_id=call_id)
             
@@ -240,39 +191,6 @@ def create_event_handlers(
                 "suggested_action": None
             }
     
-    async def on_transfer_approval(reason: str, **kwargs):
-        """Handle transfer approval."""
-        try:
-            # Get tenant config
-            config = await get_tenant_config(tenant_id)
-            
-            if config and config.enable_transfer and config.transfer_number:
-                return {
-                    "approved": True,
-                    "transfer_number": config.transfer_number,
-                    "transfer_message": "Let me transfer you to someone who can help."
-                }
-            
-            return {
-                "approved": False,
-                "denial_message": "I'm sorry, transfer is not available right now."
-            }
-        
-        except Exception as e:
-            logger.error(f"Error in transfer approval: {e}")
-            return {
-                "approved": False,
-                "denial_message": "I'm sorry, transfer is not available right now."
-            }
-    
-    async def on_fallback(error_type: str, **kwargs):
-        """Handle fallback."""
-        logger.warning(f"Fallback triggered for call {call_id}: {error_type}")
-        return {
-            "response_text": "I apologize, could you repeat that?",
-            "suggested_action": None
-        }
-    
     async def on_closing(reason: str, session_summary: dict = None, **kwargs):
         """Handle call closing."""
         try:
@@ -285,7 +203,7 @@ def create_event_handlers(
                         to_number=order.customer_phone,
                         order_summary=order_engine.get_summary(call_id)
                     )
-                    logger.info(f"Order confirmation SMS sent to {order.customer_phone}")
+                    logger.info(f"Order confirmation SMS sent")
                 except Exception as e:
                     logger.error(f"Failed to send SMS: {e}")
         
@@ -302,12 +220,7 @@ def create_event_handlers(
     
     return {
         "on_greeting": on_greeting,
-        "on_language_detect": on_language_detect,
-        "on_translate_to_english": on_translate_to_english,
-        "on_translate_from_english": on_translate_from_english,
         "on_ai_request": on_ai_request,
-        "on_transfer_approval": on_transfer_approval,
-        "on_fallback": on_fallback,
         "on_closing": on_closing,
         "on_event": on_event
     }
@@ -320,65 +233,37 @@ settings = get_settings()
 setup_logging(level=settings.log_level)
 logger = logging.getLogger(__name__)
 
-logger.info(f"Starting in {settings.environment} mode")
+logger.info(f"Starting in {settings.environment} mode (NO VOCODE)")
 
 # Validate settings
 errors = settings.validate()
 if errors:
     logger.error(f"Configuration errors: {errors}")
-    # Don't exit in production - let it fail more gracefully
     if settings.environment != "production":
         sys.exit(1)
 
-# Create Vocode config manager
-config_manager = InMemoryConfigManager()
-
-logger.info("Config manager initialized - vocode will use API keys from environment")
-
-# Create Vocode server - this creates the FastAPI app
-# Vocode will automatically use DEEPGRAM_API_KEY and ELEVENLABS_API_KEY from environment
-server = VocodeServer(
+# Create Twilio server (NO VOCODE!)
+server = TwilioServer(
     base_url=settings.vocode.base_url,
-    config_manager=config_manager,
+    deepgram_api_key=settings.speech.deepgram_api_key,
+    elevenlabs_api_key=settings.speech.elevenlabs_api_key,
+    elevenlabs_voice_id=settings.speech.elevenlabs_default_voice_id,
+    openai_api_key=settings.ai.openai_api_key,
     handler_factory=create_event_handlers
 )
 
 # Export the app for uvicorn
 app = server.app
 
-# CRITICAL: Initialize system BEFORE handling any requests
-# This ensures AI components are ready when calls come in
-async def _do_initialization():
-    """Initialize system synchronously before server starts."""
-    await initialize_system()
-    logger.info(
-        f"Server ready on {settings.vocode.host}:{settings.vocode.port}"
-    )
-
-# Force initialization on import (runs before uvicorn starts accepting requests)
-import asyncio
-try:
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        # If loop is running, schedule initialization
-        asyncio.create_task(_do_initialization())
-    else:
-        # If loop not running yet, run initialization now
-        loop.run_until_complete(_do_initialization())
-except RuntimeError:
-    # No loop yet, create one
-    asyncio.run(_do_initialization())
-
-# Keep the startup event as backup
+# Initialize system on startup
 @app.on_event("startup")
 async def startup_event():
-    """Backup startup handler."""
-    logger.info("Startup event triggered (components should already be initialized)")
-
+    """Run initialization on startup."""
+    await initialize_system()
+    logger.info("Server ready ✓")
 
 
 if __name__ == "__main__":
-    # This runs when executing directly with python main.py
     import uvicorn
     uvicorn.run(
         app,
