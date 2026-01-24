@@ -336,8 +336,8 @@ config_manager = InMemoryConfigManager()
 
 # Configure Twilio with speech services
 from vocode.streaming.models.telephony import TwilioConfig
-from vocode.streaming.models.transcriber import DeepgramTranscriberConfig, Transcriber
-from vocode.streaming.models.synthesizer import ElevenLabsSynthesizerConfig, AzureSynthesizerConfig
+from vocode.streaming.models.transcriber import DeepgramTranscriberConfig
+from vocode.streaming.models.synthesizer import ElevenLabsSynthesizerConfig
 from vocode.streaming.models.agent import ChatGPTAgentConfig
 from vocode.streaming.models.audio import AudioEncoding
 
