@@ -1,9 +1,9 @@
 """
-Main
-====
-Application entry point.
+Main Entry Point
+=================
+Application entry point for Restaurant AI Receptionist.
 
-Starts the Vocode telephony server with all components initialized.
+Initializes all components and starts the Vocode telephony server.
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from vocode_server import VocodeServer
 from vocode.streaming.telephony.config_manager.in_memory_config_manager import (
     InMemoryConfigManager
 )
+from vocode.streaming.models.message import BaseMessage
 
 
 async def initialize_system() -> None:
@@ -28,21 +29,56 @@ async def initialize_system() -> None:
     events = get_events()
     health = get_health()
     
-    logger.info("Initializing system...")
-    
-    # Simple initialization without requiring all modules
-    # You can add more initialization here as you implement the modules
+    logger.info("Initializing system components...")
     
     try:
-        health.mark_healthy("components")
-        logger.info("All components initialized")
+        # Initialize database
+        from db import get_default_db
+        db = get_default_db()
+        await db.initialize()
+        health.mark_healthy("database")
+        logger.info("✓ Database initialized")
     
     except Exception as e:
-        logger.error(f"Component initialization failed: {e}")
+        logger.error(f"Database initialization failed: {e}")
+        health.mark_unhealthy("database", str(e))
+    
+    try:
+        # Initialize AI components
+        from llm_client import get_default_client
+        from detector import get_default_detector
+        from translator import get_default_translator
+        from menu_engine import get_default_engine as get_menu_engine
+        from order_engine import get_default_engine as get_order_engine
+        from upsell_engine import get_default_engine as get_upsell_engine
+        from output_parser import get_default_parser
+        from safety import get_default_filter
+        from prompt_builder import create_operational_prompt_builder
+        from sms import get_default_client as get_sms_client
+        from tenant_config import get_default_manager as get_tenant_manager
+        
+        # Instantiate singletons (async ones need await)
+        await get_default_client()  # This is async!
+        get_default_detector()
+        get_default_translator()
+        get_menu_engine()
+        get_order_engine()
+        get_upsell_engine()
+        get_default_parser()
+        get_default_filter()
+        create_operational_prompt_builder()
+        get_sms_client()
+        get_tenant_manager()
+        
+        health.mark_healthy("components")
+        logger.info("✓ All AI components initialized")
+    
+    except Exception as e:
+        logger.error(f"Component initialization failed: {e}", exc_info=True)
         health.mark_unhealthy("components", str(e))
     
     events.log_event("system_started")
-    logger.info("System initialization complete")
+    logger.info("System initialization complete ✓")
 
 
 def create_event_handlers(
@@ -60,7 +96,7 @@ def create_event_handlers(
     
     Args:
         call_id: Call identifier
-        tenant_id: Tenant identifier
+        tenant_id: Tenant identifier  
         call_sid: Twilio call SID (optional)
         from_phone: Caller phone number (optional)
         to_phone: Destination phone number (optional)
@@ -68,73 +104,171 @@ def create_event_handlers(
     Returns:
         Dict of handler functions
     """
+    # Import with CORRECT function names
+    from menu_engine import get_default_engine as get_menu_engine
+    from order_engine import get_default_engine as get_order_engine
+    from upsell_engine import get_default_engine as get_upsell_engine
+    from llm_client import get_default_client as get_llm_client
+    from prompt_builder import create_operational_prompt_builder as get_prompt_builder
+    from output_parser import get_default_parser as get_output_parser
+    from safety import get_default_filter as get_safety_filter
+    from detector import get_default_detector
+    from translator import get_default_translator
+    from conversation_memory import create_memory, get_memory
+    from sms import send_order_confirmation
+    from tenant_config import get_tenant_config
+    
     logger = logging.getLogger(__name__)
     logger.info(f"Creating event handlers for call {call_id}")
     
-    # Simple in-memory conversation state
-    conversation_history = []
+    # Get engines (these are synchronous singletons)
+    menu_engine = get_menu_engine()
+    order_engine = get_order_engine()
+    upsell_engine = get_upsell_engine()
+    prompt_builder = get_prompt_builder()
+    output_parser = get_output_parser()
+    safety_filter = get_safety_filter()
+    detector = get_default_detector()
+    translator = get_default_translator()
+    
+    # Create conversation memory
+    memory = create_memory(call_id)
+    
+    # Create order
+    order = order_engine.create_order(call_id, tenant_id)
     
     async def on_greeting(**kwargs):
         """Handle greeting."""
-        greeting = "Thank you for calling! How can I help you today?"
-        logger.info(f"Greeting sent for call {call_id}")
-        
-        return {
-            "greeting": greeting,
-            "language": "en"
-        }
+        try:
+            # Get tenant config
+            config = await get_tenant_config(tenant_id)
+            greeting = config.greeting_message if config else "Thank you for calling! How can I help you today?"
+            
+            return {
+                "greeting": greeting,
+                "language": "en"
+            }
+        except Exception as e:
+            logger.error(f"Error in on_greeting: {e}")
+            return {
+                "greeting": "Thank you for calling! How can I help you today?",
+                "language": "en"
+            }
     
     async def on_language_detect(transcript: str, **kwargs):
         """Handle language detection."""
-        # Default to English for now
-        logger.info(f"Language detection for call {call_id}: defaulting to English")
-        
-        return {
-            "language": "en",
-            "confidence": 1.0
-        }
+        try:
+            result = detector.detect(call_id, transcript, is_final=True)
+            
+            return {
+                "language": result.language,
+                "confidence": result.confidence
+            }
+        except Exception as e:
+            logger.error(f"Error in language detection: {e}")
+            return {
+                "language": "en",
+                "confidence": 1.0
+            }
     
     async def on_translate_to_english(text: str, source_language: str, **kwargs):
         """Translate to English."""
-        # No translation for now, just return original
-        return {"translated_text": text}
+        try:
+            result = await translator.translate_to_english(text, source_language)
+            return {"translated_text": result.text}
+        except Exception as e:
+            logger.error(f"Translation error: {e}")
+            return {"translated_text": text}
     
     async def on_translate_from_english(text: str, target_language: str, **kwargs):
         """Translate from English."""
-        # No translation for now, just return original
-        return {"translated_text": text}
+        try:
+            result = await translator.translate_from_english(text, target_language)
+            return {"translated_text": result.text}
+        except Exception as e:
+            logger.error(f"Translation error: {e}")
+            return {"translated_text": text}
     
     async def on_ai_request(user_text: str, turn_count: int, **kwargs):
         """Handle AI request."""
-        logger.info(f"AI request for call {call_id}: {user_text}")
+        try:
+            # Safety check
+            safety_result = safety_filter.check_input(user_text)
+            if not safety_result.is_safe:
+                logger.warning(f"Unsafe input detected: {safety_result.reason}")
+                return {
+                    "response_text": "I didn't quite understand that. Could you rephrase?",
+                    "suggested_action": None
+                }
+            
+            # Get menu and order
+            menu = await menu_engine.get_menu(tenant_id)
+            order_summary = order_engine.get_summary(call_id)
+            
+            # Get upsell suggestions
+            upsell_suggestions = upsell_engine.get_suggestions(order, menu, max_suggestions=2)
+            upsell_text = [s.reason for s in upsell_suggestions]
+            
+            # Build prompt
+            messages = prompt_builder.build_messages(
+                user_input=user_text,
+                conversation_history=memory.get_history_as_messages(),
+                menu_data={"items": [item.to_dict() for item in menu]},
+                order_data=order.to_dict() if order else None,
+                upsell_suggestions=upsell_text
+            )
+            
+            # Call LLM (this is async!)
+            llm_client = await get_llm_client()
+            response = await llm_client.complete(messages, call_id=call_id)
+            
+            # Parse output
+            parsed = output_parser.parse(response.text)
+            
+            # Add to memory
+            memory.add_user_turn(user_text)
+            memory.add_assistant_turn(response.text)
+            
+            return {
+                "response_text": parsed.text,
+                "suggested_action": parsed.action
+            }
         
-        # Store in history
-        conversation_history.append({"role": "user", "content": user_text})
-        
-        # Simple response for now
-        response_text = "I understand you said: " + user_text + ". Our team will assist you shortly."
-        
-        conversation_history.append({"role": "assistant", "content": response_text})
-        
-        return {
-            "response_text": response_text,
-            "suggested_action": None
-        }
+        except Exception as e:
+            logger.error(f"Error in AI request: {e}", exc_info=True)
+            return {
+                "response_text": "I apologize, could you repeat that?",
+                "suggested_action": None
+            }
     
     async def on_transfer_approval(reason: str, **kwargs):
         """Handle transfer approval."""
-        logger.info(f"Transfer request for call {call_id}: {reason}")
+        try:
+            # Get tenant config
+            config = await get_tenant_config(tenant_id)
+            
+            if config and config.enable_transfer and config.transfer_number:
+                return {
+                    "approved": True,
+                    "transfer_number": config.transfer_number,
+                    "transfer_message": "Let me transfer you to someone who can help."
+                }
+            
+            return {
+                "approved": False,
+                "denial_message": "I'm sorry, transfer is not available right now."
+            }
         
-        # Deny transfers for now
-        return {
-            "approved": False,
-            "denial_message": "I'm sorry, transfer is not available right now."
-        }
+        except Exception as e:
+            logger.error(f"Error in transfer approval: {e}")
+            return {
+                "approved": False,
+                "denial_message": "I'm sorry, transfer is not available right now."
+            }
     
     async def on_fallback(error_type: str, **kwargs):
         """Handle fallback."""
         logger.warning(f"Fallback triggered for call {call_id}: {error_type}")
-        
         return {
             "response_text": "I apologize, could you repeat that?",
             "suggested_action": None
@@ -142,12 +276,30 @@ def create_event_handlers(
     
     async def on_closing(reason: str, session_summary: dict = None, **kwargs):
         """Handle call closing."""
-        logger.info(f"Call {call_id} closing: {reason}")
-        # No action needed for now
+        try:
+            logger.info(f"Call {call_id} closing: {reason}")
+            
+            # Send SMS if order created
+            if order and not order.is_empty() and order.customer_phone:
+                try:
+                    await send_order_confirmation(
+                        to_number=order.customer_phone,
+                        order_summary=order_engine.get_summary(call_id)
+                    )
+                    logger.info(f"Order confirmation SMS sent to {order.customer_phone}")
+                except Exception as e:
+                    logger.error(f"Failed to send SMS: {e}")
+        
+        except Exception as e:
+            logger.error(f"Error in closing handler: {e}")
     
     async def on_event(event: dict, **kwargs):
         """Handle generic events."""
-        logger.info(f"Event for call {call_id}: {event.get('type', 'unknown')}")
+        try:
+            events = get_events()
+            events.log_event(event.get("type", "unknown"), **event.get("data", {}))
+        except Exception as e:
+            logger.error(f"Error logging event: {e}")
     
     return {
         "on_greeting": on_greeting,
@@ -179,8 +331,50 @@ if errors:
     if settings.environment != "production":
         sys.exit(1)
 
+# Configure vocode with speech services
+from vocode.streaming.models.transcriber import DeepgramTranscriberConfig
+from vocode.streaming.models.synthesizer import ElevenLabsSynthesizerConfig
+from vocode.streaming.models.agent import ChatGPTAgentConfig
+from vocode.streaming.models.audio import AudioEncoding
+
 # Create Vocode config manager
 config_manager = InMemoryConfigManager()
+
+# Configure Deepgram (Speech-to-Text)
+logger.info("Configuring Deepgram transcriber")
+transcriber_config = DeepgramTranscriberConfig(
+    sampling_rate=8000,  # Phone quality
+    audio_encoding=AudioEncoding.MULAW,  # Twilio uses mulaw
+    chunk_size=20 * 160,  # 20ms chunks at 8kHz
+    model="nova-2-phonecall",  # Best for phone calls
+    tier="nova",
+    language="en-US"
+)
+config_manager.set_transcriber_config(transcriber_config)
+
+# Configure ElevenLabs (Text-to-Speech)
+logger.info("Configuring ElevenLabs synthesizer")
+synthesizer_config = ElevenLabsSynthesizerConfig(
+    sampling_rate=8000,  # Phone quality
+    audio_encoding=AudioEncoding.MULAW,  # Twilio uses mulaw
+    api_key=settings.speech.elevenlabs_api_key,
+    voice_id=settings.speech.elevenlabs_default_voice_id,
+    model_id="eleven_turbo_v2",  # Fast model for real-time
+    optimize_streaming_latency=4  # Optimize for streaming
+)
+config_manager.set_synthesizer_config(synthesizer_config)
+
+# Configure minimal agent (vocode requires this even though we override it)
+logger.info("Configuring ChatGPT agent")
+agent_config = ChatGPTAgentConfig(
+    openai_api_key=settings.ai.openai_api_key,
+    initial_message=BaseMessage(text="Hello"),
+    model_name=settings.ai.openai_primary_model,
+    temperature=settings.ai.openai_temperature
+)
+config_manager.set_agent_config(agent_config)
+
+logger.info("Vocode configuration complete")
 
 # Create Vocode server - this creates the FastAPI app
 server = VocodeServer(
@@ -192,14 +386,35 @@ server = VocodeServer(
 # Export the app for uvicorn
 app = server.app
 
-# Initialize system on startup
-@app.on_event("startup")
-async def startup_event():
-    """Run initialization on startup."""
+# CRITICAL: Initialize system BEFORE handling any requests
+# This ensures AI components are ready when calls come in
+async def _do_initialization():
+    """Initialize system synchronously before server starts."""
     await initialize_system()
     logger.info(
-        f"Server started on {settings.vocode.host}:{settings.vocode.port}"
+        f"Server ready on {settings.vocode.host}:{settings.vocode.port}"
     )
+
+# Force initialization on import (runs before uvicorn starts accepting requests)
+import asyncio
+try:
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # If loop is running, schedule initialization
+        asyncio.create_task(_do_initialization())
+    else:
+        # If loop not running yet, run initialization now
+        loop.run_until_complete(_do_initialization())
+except RuntimeError:
+    # No loop yet, create one
+    asyncio.run(_do_initialization())
+
+# Keep the startup event as backup
+@app.on_event("startup")
+async def startup_event():
+    """Backup startup handler."""
+    logger.info("Startup event triggered (components should already be initialized)")
+
 
 
 if __name__ == "__main__":
