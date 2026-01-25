@@ -164,8 +164,8 @@ def create_event_handlers(
             order_summary = order.get_summary() if order else None
             
             # Get upsell suggestions
-            upsell_suggestions = upsell_engine.get_suggestions(order, menu, max_suggestions=2)
-            upsell_text = [s.reason for s in upsell_suggestions]
+            upsell_suggestions = upsell_engine.suggest_upsells(order, menu, max_suggestions=2)
+            upsell_text = [s.reason for s in upsell_suggestions] if upsell_suggestions else []
             
             # Build prompt
             messages = prompt_builder.build_messages(
