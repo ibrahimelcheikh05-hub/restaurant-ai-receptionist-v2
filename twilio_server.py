@@ -153,7 +153,12 @@ class TwilioServer:
                 logger.info(f"✓ Call controller started")
                 
                 greeting_result = await controller._call_handler("on_greeting")
-                greeting_text = greeting_result.get("greeting", "Hello!")
+                greeting_text = greeting_result.get("greeting") if greeting_result else None
+                
+                if not greeting_text:
+                    greeting_text = "Thank you for calling! How can I help you today?"
+                    logger.warning(f"No greeting from handler, using default")
+                
                 logger.info(f"🎙️ Greeting: {greeting_text}")
                 
                 await audio_pipeline.speak(greeting_text)
