@@ -178,8 +178,7 @@ def create_event_handlers(
                 user_input=user_text,
                 conversation_history=memory.get_history_as_messages(),
                 menu_data={"items": [item.to_dict() for item in menu]},
-                order_data=order.to_dict() if order else None,
-                upsell_suggestions=upsell_text
+                order_data=order.to_dict() if order else None
             )
             
             # Call LLM
