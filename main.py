@@ -164,8 +164,14 @@ def create_event_handlers(
             order_summary = order.get_summary() if order else None
             
             # Get upsell suggestions
-            upsell_suggestions = upsell_engine.suggest_upsells(order, menu, max_suggestions=2)
-            upsell_text = [s.reason for s in upsell_suggestions] if upsell_suggestions else []
+            order_canonical_ids = [item.get("canonical_id") for item in order_summary.get("items", [])] if order_summary else []
+            upsell_suggestions = upsell_engine.suggest_upsells(
+                call_id=call_id,
+                order_canonical_ids=order_canonical_ids,
+                order_state=order_summary.get("state", "active") if order_summary else "active",
+                order_item_count=len(order_canonical_ids)
+            ) if order_canonical_ids else []
+            upsell_text = upsell_suggestions  # Already list of strings
             
             # Build prompt
             messages = prompt_builder.build_messages(
