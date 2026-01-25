@@ -72,6 +72,7 @@ class AudioPipeline:
         self.barge_in_detected = False
         self.deepgram_ws = None
         self.twilio_ws = None
+        self.stream_sid = None  # Will be set from Twilio start event
         
         # Buffers
         self.audio_queue = asyncio.Queue()
@@ -186,7 +187,9 @@ class AudioPipeline:
                     await self.audio_queue.put(audio_data)
                 
                 elif event_type == "start":
-                    logger.info(f"Twilio stream started for call {self.call_id}")
+                    # Store the stream SID for sending audio back
+                    self.stream_sid = message.get("start", {}).get("streamSid")
+                    logger.info(f"Twilio stream started for call {self.call_id}, stream_sid: {self.stream_sid}")
                 
                 elif event_type == "stop":
                     logger.info(f"Twilio stream stopped for call {self.call_id}")
@@ -207,7 +210,7 @@ class AudioPipeline:
                 # Send to Twilio
                 message = {
                     "event": "media",
-                    "streamSid": self.call_id,
+                    "streamSid": self.stream_sid or self.call_id,  # Use captured stream_sid
                     "media": {
                         "payload": base64.b64encode(audio_chunk).decode()
                     }
