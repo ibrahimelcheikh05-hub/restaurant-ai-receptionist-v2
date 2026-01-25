@@ -120,7 +120,7 @@ class TwilioServer:
                 async def on_transcript(text: str, is_final: bool):
                     if is_final and text.strip():
                         logger.info(f"🎤 User said: {text}")
-                        result = await controller._invoke_handler(
+                        result = await controller._call_handler(
                             "on_ai_request",
                             user_text=text,
                             turn_count=1
@@ -152,7 +152,7 @@ class TwilioServer:
                 await controller.start()
                 logger.info(f"✓ Call controller started")
                 
-                greeting_result = await controller._invoke_handler("on_greeting")
+                greeting_result = await controller._call_handler("on_greeting")
                 greeting_text = greeting_result.get("greeting", "Hello!")
                 logger.info(f"🎙️ Greeting: {greeting_text}")
                 
