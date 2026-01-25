@@ -240,23 +240,19 @@ class AudioPipeline:
         logger.info(f"Speaking: {text}")
         
         try:
-            # Call ElevenLabs streaming API
+            # Call ElevenLabs streaming API  
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.elevenlabs_voice_id}/stream"
             
             headers = {
-                "Accept": "audio/mpeg",  # ElevenLabs returns MP3
+                "Accept": "audio/wav",  # Request WAV format
                 "Content-Type": "application/json",
                 "xi-api-key": self.elevenlabs_api_key
             }
             
             data = {
                 "text": text,
-                "model_id": "eleven_turbo_v2",
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.75
-                },
-                "output_format": "ulaw_8000"  # Request mulaw format directly!
+                "model_id": "eleven_turbo_v2_5",  # Use latest turbo model
+                "output_format": "pcm_16000"  # 16kHz PCM
             }
             
             async with aiohttp.ClientSession() as session:
