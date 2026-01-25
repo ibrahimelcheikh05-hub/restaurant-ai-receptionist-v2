@@ -130,66 +130,64 @@ class TwilioServer:
         @self.app.websocket("/media/{call_id}")
         async def handle_media_stream(websocket: WebSocket, call_id: str):
             """Handle Twilio media stream WebSocket."""
-            await websocket.accept()
-            logger.info(f"WebSocket connected for call {call_id}")
+            logger.info(f"WebSocket connection attempt for call {call_id}")
+            
+            try:
+                await websocket.accept()
+                logger.info(f"✓ WebSocket accepted for call {call_id}")
+            except Exception as e:
+                logger.error(f"✗ WebSocket accept failed: {e}", exc_info=True)
+                return
             
             controller = self.calls.get(call_id)
             if not controller:
-                logger.error(f"No controller found for call {call_id}")
-                await websocket.close()
+                logger.error(f"✗ No controller found for call {call_id}")
+                try:
+                    await websocket.close()
+                except:
+                    pass
                 return
             
+            logger.info(f"✓ Controller found for call {call_id}")
+            
             try:
-                # Create audio pipeline
-                async def on_transcript(text: str, is_final: bool):
-                    """Handle transcript from Deepgram."""
-                    if is_final and text.strip():
-                        logger.info(f"User said: {text}")
+                # Test: Just log messages for now to see what we're receiving
+                logger.info(f"Starting WebSocket message loop for call {call_id}")
+                message_count = 0
+                
+                while True:
+                    try:
+                        message = await websocket.receive_json()
+                        message_count += 1
                         
-                        # Call AI handler
-                        result = await controller._invoke_handler(
-                            "on_ai_request",
-                            user_text=text,
-                            turn_count=1
-                        )
+                        event_type = message.get("event", "unknown")
                         
-                        response_text = result.get("response_text", "")
-                        if response_text:
-                            # Speak response
-                            await audio_pipeline.speak(response_text)
+                        if message_count <= 5:  # Log first 5 messages
+                            logger.info(f"Message #{message_count}: event={event_type}, keys={list(message.keys())}")
+                        
+                        if event_type == "start":
+                            logger.info(f"✓ Twilio stream STARTED for call {call_id}")
+                            logger.info(f"Stream info: {message.get('start', {})}")
+                        
+                        elif event_type == "media":
+                            if message_count == 6:  # Log only once after first 5
+                                logger.info(f"✓ Receiving media packets (will log every 100th)")
+                            if message_count % 100 == 0:
+                                logger.info(f"Received {message_count} messages so far...")
+                        
+                        elif event_type == "stop":
+                            logger.info(f"✓ Twilio stream STOPPED for call {call_id}")
+                            break
+                        
+                        else:
+                            logger.info(f"Unknown event type: {event_type}")
+                    
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}", exc_info=True)
+                        break
                 
-                async def on_speaking_started():
-                    """Called when AI starts speaking."""
-                    controller.is_ai_speaking = True
-                
-                async def on_speaking_finished():
-                    """Called when AI finishes speaking."""
-                    controller.is_ai_speaking = False
-                
-                audio_pipeline = AudioPipeline(
-                    call_id=call_id,
-                    deepgram_api_key=self.deepgram_api_key,
-                    elevenlabs_api_key=self.elevenlabs_api_key,
-                    elevenlabs_voice_id=self.elevenlabs_voice_id,
-                    on_transcript=on_transcript,
-                    on_speaking_started=on_speaking_started,
-                    on_speaking_finished=on_speaking_finished
-                )
-                
-                self.audio_pipelines[call_id] = audio_pipeline
-                
-                # Start call controller
-                await controller.start()
-                
-                # Get greeting
-                greeting_result = await controller._invoke_handler("on_greeting")
-                greeting_text = greeting_result.get("greeting", "Hello!")
-                
-                # Speak greeting
-                await audio_pipeline.speak(greeting_text)
-                
-                # Start audio pipeline (this blocks until call ends)
-                await audio_pipeline.start(websocket)
+                logger.info(f"WebSocket loop ended for call {call_id}, total messages: {message_count}")
+                logger.info(f"WebSocket loop ended for call {call_id}, total messages: {message_count}")
             
             except WebSocketDisconnect:
                 logger.info(f"WebSocket disconnected for call {call_id}")
@@ -200,11 +198,17 @@ class TwilioServer:
             finally:
                 # Cleanup
                 if call_id in self.audio_pipelines:
-                    await self.audio_pipelines[call_id].stop()
+                    try:
+                        await self.audio_pipelines[call_id].stop()
+                    except:
+                        pass
                     del self.audio_pipelines[call_id]
                 
                 if call_id in self.calls:
-                    await self.calls[call_id].stop()
+                    try:
+                        await self.calls[call_id].stop()
+                    except:
+                        pass
                     del self.calls[call_id]
                 
                 logger.info(f"Call {call_id} cleaned up")
@@ -214,7 +218,17 @@ class TwilioServer:
             """Health check endpoint."""
             return {
                 "status": "healthy",
-                "active_calls": len(self.calls)
+                "active_calls": len(self.calls),
+                "websocket_endpoint": f"{self.base_url}/media/{{call_id}}"
+            }
+        
+        @self.app.get("/test-ws/{call_id}")
+        async def test_websocket(call_id: str):
+            """Test if WebSocket endpoint is accessible."""
+            ws_url = f"{self.base_url.replace('https://', 'wss://').replace('http://', 'ws://')}/media/{call_id}"
+            return {
+                "websocket_url": ws_url,
+                "message": "WebSocket endpoint ready"
             }
     
     def _extract_tenant_id(self, to_phone: str) -> str:
