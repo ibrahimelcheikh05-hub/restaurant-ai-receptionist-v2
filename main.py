@@ -161,7 +161,7 @@ def create_event_handlers(
             
             # Get menu and order
             menu = await menu_engine.get_menu(tenant_id)
-            order_summary = order_engine.get_summary(call_id)
+            order_summary = order.get_summary() if order else None
             
             # Get upsell suggestions
             upsell_suggestions = upsell_engine.get_suggestions(order, menu, max_suggestions=2)
