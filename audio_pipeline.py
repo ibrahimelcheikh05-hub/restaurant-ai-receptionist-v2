@@ -244,7 +244,7 @@ class AudioPipeline:
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.elevenlabs_voice_id}/stream"
             
             headers = {
-                "Accept": "audio/mpeg",
+                "Accept": "audio/mpeg",  # ElevenLabs returns MP3
                 "Content-Type": "application/json",
                 "xi-api-key": self.elevenlabs_api_key
             }
@@ -255,7 +255,8 @@ class AudioPipeline:
                 "voice_settings": {
                     "stability": 0.5,
                     "similarity_boost": 0.75
-                }
+                },
+                "output_format": "ulaw_8000"  # Request mulaw format directly!
             }
             
             async with aiohttp.ClientSession() as session:
