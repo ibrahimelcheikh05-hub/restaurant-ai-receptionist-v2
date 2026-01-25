@@ -126,14 +126,22 @@ def create_event_handlers(
         """Handle greeting."""
         try:
             config = await get_tenant_config(tenant_id)
-            greeting = config.greeting_message if config else "Thank you for calling! How can I help you today?"
+            greeting = None
+            
+            if config and hasattr(config, 'greeting_message'):
+                greeting = config.greeting_message
+            
+            if not greeting:
+                greeting = "Thank you for calling! How can I help you today?"
+            
+            logger.info(f"Greeting handler returning: {greeting}")
             
             return {
                 "greeting": greeting,
                 "language": "en"
             }
         except Exception as e:
-            logger.error(f"Error in on_greeting: {e}")
+            logger.error(f"Error in on_greeting: {e}", exc_info=True)
             return {
                 "greeting": "Thank you for calling! How can I help you today?",
                 "language": "en"
